@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "TMDB JSON Extractor Pro",
+  "version": "1.4",
+  "description": "TMDB 페이지에서 정보를 JSON으로 추출하고 복사합니다.",
+  "permissions": [
+    "contextMenus",
+    "clipboardWrite",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://www.themoviedb.org/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.themoviedb.org/*"
+      ],
+      "js": [
+        "content.js"
+      ]
+    }
+  ]
+}
