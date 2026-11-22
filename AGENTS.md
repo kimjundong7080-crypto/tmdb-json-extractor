@@ -981,3 +981,172 @@ fallback only.
 - **Not verified**: a real crawl with the reloaded extension (no `chrome://extensions` access
   here), so `mediaType`, the 60-language gallery cap, and in-page Wikipedia/OMDb enrichment were
   not exercised against live TMDB pages.
+
+## Session handoff — current state (2026-11-22, latest)
+
+**Start here.** Everything above is historical; where versions or behavior disagree, this section
+wins. Read the "Remaining work" list before changing code.
+
+### Versions
+
+| Item | Value |
+| --- | --- |
+| `manifest.json` version | `1.7.3` (adds `https://*.wikipedia.org/*` host permission) |
+| Media/person `schemaVersion` | `1.7.4` (adds `mediaType`, `wikipedia`) |
+| `index.json` `schemaVersion` | `1.7.4` (written by `crawler.js` `exportIndex`) |
+| Latest commits | `73fcfb2` (OMDb/Wikipedia + gallery cap), `af2f57c` (sitemap permission) |
+
+The manifest version is deliberately one patch behind the payload schema; bump it only when a
+packaged release is requested. Older sections in this file mention 1.7.2 / 1.7 / 1.5 — ignore
+those numbers for current work.
+
+### What the code does now (entry points by name, not line)
+
+`background.js`
+
+- `parseOmdbKeyText` + `loadOmdbKeyFile` (`action: "crawlerOmdbKeyFile"`) read `OMDb API.txt`
+  from the extension folder. The parser accepts a bare key, `apikey=...`, `API Key: ...`, an OMDb
+  URL, or JSON containing `apikey`; plain OMDb *response* JSON yields `""` so no word in the body
+  is mistaken for a key. Three URL-encoding variants are tried because the filename has a space.
+- `testOmdbKey` (`action: "testOmdbKey"`) calls OMDb with `tt3896198` from the service worker so
+  no CORS/host-permission surprises reach the panel.
+
+`crawler.js`
+
+- `requestOmdbKeyFile()` runs at every page start *before* the queue is processed and overwrites
+  `settings.omdbApiKey` when the file contains a valid key, so the file always wins over a stale
+  stored key. Failure/invalid-key cases are logged once.
+- `useWikipedia` setting (default `true`) flows through defaults → `normalizeSettings` →
+  extraction options → panel checkbox `Wikipedia 요약 보강`.
+- Panel button `API 테스트` (`data-crawl="omdbTest"`) stores the typed key, then calls the
+  background test and reports title/year/rating in a toast and the crawl log.
+- `exportIndex` writes `schemaVersion: "1.7.4"`.
+
+`content.js`
+
+- `MAX_EXTRA_LANGUAGES` is `60` in `fetchGalleryUrls` (was 30, which truncated 35-language
+  galleries such as Star Wars and left 469/473 posters). When `recordCount() < targetCount` the
+  page now reports `TMDB <kind> 갤러리 미완료`. `reportEnrichmentIssue` forwards it to the crawl
+  log, so a short gallery is visible instead of silent.
+- `formatRuntimeMinutes` + `splitOmdbList` + `mergeOmdb`: OMDb fills only empty fields
+  (`certification`, `homepage`, `runtime`, `genres`, `productionCompanies`,
+  `productionCountries`, `spokenLanguages`, `overview`). Runtime is normalized to TMDB's
+  `2h 22m` form. Arrays are `Array.isArray`-guarded so a partially built payload cannot throw.
+- `wikipediaCandidates` → `fetchWikipediaSummary` → `fetchWikipediaEnrichment` → `mergeWikipedia`:
+  REST summary API, candidates in page-locale → original language → English order (max 5),
+  disambiguation rejected, 30-minute in-page cache, success-only caching, and the candidate loop
+  continues after a failed request. It runs only when `overview` is still empty, and stores
+  `wikipedia: { lang, title, url, description }` (the extract becomes `overview`).
+  It executes after Wikidata → OMDb inside one serialized task.
+- `languageCodeFromName` back-fills `originalLanguageCode` from the localized original-language
+  label when Wikidata has no item (e.g. `영어` → `en`).
+- `mediaType: "tv" | "movie"` is set on media payloads; `type` stays as-is because TV pages put
+  `"Scripted"` there.
+
+`python/enrich.py`
+
+- `read_omdb_key_file` reads `<project>/OMDb API.txt` with the same accepted formats, so the
+  extension and Python never disagree about the key. `--omdb-key` / `OMDB_API_KEY` still work
+  and take precedence.
+- `format_runtime_minutes`, `split_omdb_list`, extended `merge_omdb`: same fields, same
+  only-empty rule, same `2h 22m` format as JS.
+- `wikipedia_candidates`, `fetch_wikipedia` (7-day cache, **successful results only**),
+  `merge_wikipedia`, `--no-wikipedia`. Runs after OMDb; skipped when `overview` is present.
+- `http_json(quiet=True)` is used for Wikipedia so expected 404s do not spam stderr.
+- Wikidata chunks with an empty result are no longer cached (a 429 used to block retries for
+  7 days).
+
+### Keys and local files
+
+- OMDb key lives in `OMDb API.txt` at the project root and is gitignored. A fresh clone has no
+  key: the extension then depends on the panel key in `chrome.storage`, and Python on
+  `--omdb-key`/`OMDB_API_KEY`. Nothing in the repo contains a key.
+- Crawl output folder used in testing: `C:/Users/ssii/Downloads/tmdb` (outside the repo).
+  It currently holds only `movie-13` … `movie-18`; the `movie-6/8/9/11` files from earlier notes
+  are gone. Do not assume old IDs or counts still exist.
+- Each `--inplace` run leaves one `*.json.bak` per file (gitignored) and a
+  `.cache/enrich-cache.json` under the output folder.
+- If the Korean text in a terminal looks like `?곸뼱`, that is the Windows console codepage, not
+  corrupted JSON. The files are written UTF-8 without BOM. Do not "fix" this.
+
+### Verification performed in this session
+
+- `node --check content.js crawler.js background.js`, `py -m py_compile python/enrich.py`: pass.
+- Python unit test of `merge_omdb`: empty document filled with `R`, `2h 22m`, genres, companies,
+  countries, languages; TMDB values untouched.
+- End-to-end CLI test on an isolated copy of `movie-17-the-dark` with blanked fields, run through
+  `python/enrich.py --inplace --no-wikidata`: wrote source `omdb` and filled `certification: R`,
+  `runtime: 1h 33m`, `Drama/Fantasy/Horror`, 4 countries, 2 languages. This proves the fill path
+  through the real CLI, not just the merge function.
+- Real run `py python/enrich.py "C:/Users/ssii/Downloads/tmdb" --inplace`: 6 scanned, 6 written,
+  all source `omdb`, backups created. Existing values preserved (`citizen-kane` keeps `NR` over
+  OMDb's `PG`; every runtime stayed `2h 22m`-style). `omdb` objects now carry rated/runtime/
+  country/language for all six titles.
+- Wikidata returned HTTP 429 for the whole batch and contributed nothing; the run still wrote
+  OMDb data and did not cache the empty Wikidata result, so the next run retries it.
+- Committed and pushed as `73fcfb2` to `origin/main`.
+
+### Remaining work (in suggested order)
+
+1. **Reload and re-crawl in real Chrome** (the one thing no agent here can do):
+   `chrome://extensions` → reload the unpacked extension → `방문기록 초기화` → re-crawl a title with
+   a large gallery. Confirm `mediaType`, `schemaVersion "1.7.4"`, no `갤러리 미완료` warning, and
+   that Star Wars-class titles reach the full poster count (previously 469/473).
+2. **Verify in-page OMDb/Wikipedia enrichment after reload**: with `OMDb API.txt` present and
+   `useWikipedia` on, crawl one title whose `overview` is empty (or blank it in the page DOM) and
+   confirm the payload gets `omdb` fields and a `wikipedia` object. This path is unit-tested but
+   has never run against a live TMDB page.
+3. **Export the index**: `인덱스 내보내기` → confirm `index.json` reports `schemaVersion: "1.7.4"`.
+   There is currently no `index.json` in the output folder.
+4. **Re-run Python enrichment for Wikidata** once the rate limit clears:
+   `py python/enrich.py "C:/Users/ssii/Downloads/tmdb" --inplace`. Expect `wikidata` objects and
+   possibly extra companies/countries; OMDb values already present are not overwritten.
+5. **Restart any running watcher**: the watcher started before these edits still runs old code and
+   holds `.cache/enrich-watch.lock`. Stop that process first (the lock only prevents a second
+   instance), then start `py python/enrich.py <dir> --watch --inplace` if watch mode is wanted.
+   Delete the lock only after confirming no process holds it.
+6. **Manifest version**: bump to `1.7.4` (or higher) when packaging a release so the extension
+   version matches the payload schema; the ZIP in the repo is still stale 1.3 and should be
+   regenerated only on request.
+7. **Stale existing JSON**: any file crawled before 1.7.4 has no `mediaType` and no `wikipedia`.
+   Either re-crawl or accept it; Python enrichment does not add `mediaType`.
+
+### Known issues and caveats
+
+- **Earlier AGENTS.md sections are stale** in places: they describe 1.7.2, a 30-language gallery
+  cap, `runtime` as `"79 min"`, and claim no `mediaType`. This section supersedes all of them.
+- **Python Wikipedia candidate order is hardcoded ko-first** (`add("ko", ...)`) while the
+  extension uses the page locale. With `language: en-US` the two can pick different Wikipedia
+  articles. Fix by passing a locale or by deriving the first candidate from `originalLanguageCode`
+  if exact parity matters.
+- **Wikipedia only runs when `overview` is empty.** TMDB almost always has an overview, so
+  `wikipedia` objects are rare in practice. This is intentional (fallback-only) but means the
+  `wikipedia` field is usually `null`; do not treat that as a bug.
+- **OMDb values are English** and only fill empty fields, so a filled field can mix languages with
+  TMDB's localized values.
+- **Wikidata is rate limited** (HTTP 429) and has no key; the query needs 30 s backoff and can
+  still fail. Empty results are not cached any more, so retrying is cheap.
+- **No live crawl has been done by an agent** in this or the previous session: no
+  `chrome://extensions` access, and TMDB answers 403 to curl/Python (Cloudflare), so page checks
+  are only possible from a real browser session.
+- **Gallery count 473 → 60 languages**: the cap is now above the largest observed language count
+  (35), but a future title with more than 60 language filters could still be short; the new
+  `갤러리 미완료` warning is the signal to raise it again.
+- **`settings.json` is rewritten by the extension** (File System Access). A diff that looks like
+  key reordering is normal; commit it or not, it is not semantic.
+- The untracked folder `샘플 html_용량이 크니 읽지 마시오/` is large sample HTML. It is intentionally
+  not committed and should not be read.
+
+### Commands
+
+```powershell
+node --check content.js
+node --check crawler.js
+node --check background.js
+py -m py_compile python/enrich.py
+py python/enrich.py "C:/Users/ssii/Downloads/tmdb" --inplace
+py python/enrich.py "C:/Users/ssii/Downloads/tmdb" --dry-run   # preview sources per file
+```
+
+Git state at handoff: `main` clean except the untracked sample folder; `origin/main` matches
+local after the push that records this section.
