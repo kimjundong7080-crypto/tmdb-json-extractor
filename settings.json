@@ -24,7 +24,6 @@
   "autoFollowLimit": 8,
   "overwrite": true,
   "autoLog": true,
-  "useWikidata": true,
   "humanize": true,
   "readDelay": true,
   "minDelayMs": 3000,
@@ -36,5 +35,6 @@
   "breakMinSec": 120,
   "breakMaxSec": 300,
   "maxListPages": 300,
-  "folder": "tmdb"
+  "folder": "tmdb",
+  "useWikidata": true
 }

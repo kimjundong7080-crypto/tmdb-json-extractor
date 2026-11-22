@@ -3,7 +3,8 @@
 
 Reads JSON files produced by the Chrome extension and adds auxiliary metadata from:
   - Wikidata (companies, countries, languages, IMDb ID, official website, person dates)
-  - OMDb (ratings, poster, plot; requires OMDb API key)
+  - OMDb (ratings, poster, plot, country/language/production; requires OMDb API key)
+  - Wikipedia (summary text when overview is empty)
   - IMDb public datasets (basics, ratings, crew; optional --imdb-dir)
 
 Only missing fields are filled; existing values are preserved. Standard library only.
@@ -32,7 +33,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
+OMDB_KEY_FILE = Path(__file__).resolve().parent.parent / "OMDb API.txt"
 OMDB_ENDPOINT = "https://www.omdbapi.com/"
+WIKIPEDIA_CACHE_TTL = 7 * 24 * 3600
 USER_AGENT = "tmdb-json-extractor-enricher/1.0 (personal, non-commercial)"
 
 KIND_PROPERTY = {
@@ -84,7 +87,8 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def http_json(url: str, headers: dict | None = None, timeout: int = 30, retries: int = 3) -> dict | None:
+def http_json(url: str, headers: dict | None = None, timeout: int = 30, retries: int = 3,
+              quiet: bool = False) -> dict | None:
     request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if headers:
         request_headers.update(headers)
@@ -105,13 +109,15 @@ def http_json(url: str, headers: dict | None = None, timeout: int = 30, retries:
             if error.code in (500, 502, 503, 504) and attempt < retries:
                 time.sleep(2 * (attempt + 1))
                 continue
-            print(f"[http] {error.code} {url[:120]}", file=sys.stderr)
+            if not quiet:
+                print(f"[http] {error.code} {url[:120]}", file=sys.stderr)
             return None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            print(f"[http] {error} {url[:120]}", file=sys.stderr)
+            if not quiet:
+                print(f"[http] {error} {url[:120]}", file=sys.stderr)
             return None
     return None
 
@@ -129,6 +135,40 @@ def detect_kind(path: Path, data: dict) -> str | None:
     return None
 
 
+def read_omdb_key_file() -> str:
+    """Read the shared OMDb key file in the project root (the extension folder).
+
+    Accepts a bare key, `apikey=...`, `API Key: ...`, an OMDb URL, or JSON that
+    contains an apikey field. Plain OMDb response JSON has no key and yields "".
+    """
+    try:
+        text = OMDB_KEY_FILE.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+
+    if text.startswith("{") or text.startswith("["):
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return ""
+        if isinstance(data, dict):
+            for name in ("apikey", "apiKey", "api_key", "key"):
+                value = str(data.get(name) or "").strip()
+                if re.fullmatch(r"[A-Za-z0-9]{6,32}", value):
+                    return value
+        return ""
+
+    line = next((row.strip() for row in text.splitlines() if row.strip()), "")
+    match = re.search(r"[?&]apikey=([A-Za-z0-9]{6,32})", line, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    after_separator = re.split(r"[:=]", line)[-1].strip().strip("\"'")
+    match = re.search(r"[A-Za-z0-9]{6,32}", after_separator)
+    return match.group(0) if match else ""
+
+
 def collect_wikidata(kinds_to_ids: dict[str, list[str]], cache: dict, chunk_delay: float = 0.0) -> dict[str, dict]:
     results: dict[str, dict] = {}
     for kind, ids in kinds_to_ids.items():
@@ -138,7 +178,9 @@ def collect_wikidata(kinds_to_ids: dict[str, list[str]], cache: dict, chunk_dela
             chunk = unique_ids[start:start + 25]
             cache_key = f"wikidata:{kind}:{','.join(chunk)}"
             cached = cache.get(cache_key)
-            if cached and time.time() - cached.get("ts", 0) < 7 * 24 * 3600:
+            # 빈 결과는 캐시로 재사용하지 않는다. 429/일시 오류로 빈 응답을 받은 뒤
+            # 7일 동안 재시도가 막히는 문제를 피하기 위함이다.
+            if cached and cached.get("data") and time.time() - cached.get("ts", 0) < 7 * 24 * 3600:
                 results.update(cached.get("data", {}))
                 continue
 
@@ -194,7 +236,8 @@ def collect_wikidata(kinds_to_ids: dict[str, list[str]], cache: dict, chunk_dela
                     entry["birthPlace"] = value_of(row, "birthPlaceLabel")
                 push_unique(entry["citizenship"], value_of(row, "citizenshipLabel"))
 
-            cache[cache_key] = {"ts": time.time(), "data": batch}
+            if batch:
+                cache[cache_key] = {"ts": time.time(), "data": batch}
             results.update(batch)
             if chunk_delay > 0:
                 time.sleep(chunk_delay)
@@ -352,6 +395,25 @@ def fetch_omdb(api_key: str, data: dict, kind: str, cache: dict) -> dict | None:
     return result
 
 
+def split_omdb_list(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",")
+            if item.strip() and item.strip() != "N/A"]
+
+
+def format_runtime_minutes(value: str) -> str:
+    """Format OMDb's "142 min" like TMDB's "2h 22m" so one field has one format."""
+    match = re.search(r"\d+", str(value or ""))
+    total = int(match.group(0)) if match else 0
+    if not total:
+        return ""
+    hours, minutes = divmod(total, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
 def merge_omdb(data: dict, omdb: dict) -> bool:
     if not omdb:
         return False
@@ -364,6 +426,105 @@ def merge_omdb(data: dict, omdb: dict) -> bool:
         changed = True
     if not data.get("overview") and omdb.get("plot"):
         data["overview"] = omdb["plot"]
+        changed = True
+
+    # TMDB에 없는 항목을 OMDb로 보강한다(이미 값이 있으면 기존 값을 유지).
+    rated = str(omdb.get("rated") or "")
+    if not data.get("certification") and rated and rated != "N/A":
+        data["certification"] = rated
+        changed = True
+    website = str(omdb.get("website") or "")
+    if not data.get("homepage") and website and website != "N/A":
+        data["homepage"] = website
+        changed = True
+    runtime = format_runtime_minutes(omdb.get("runtime"))
+    if not data.get("runtime") and runtime:
+        data["runtime"] = runtime
+        changed = True
+    if not data.get("genres"):
+        genres = split_omdb_list(omdb.get("genre"))
+        if genres:
+            data["genres"] = genres
+            changed = True
+    if not data.get("productionCompanies"):
+        companies = split_omdb_list(omdb.get("production"))
+        if companies:
+            data["productionCompanies"] = [{"name": name} for name in companies]
+            changed = True
+    if not data.get("productionCountries"):
+        countries = split_omdb_list(omdb.get("country"))
+        if countries:
+            data["productionCountries"] = [{"name": name} for name in countries]
+            changed = True
+    if not data.get("spokenLanguages"):
+        languages = split_omdb_list(omdb.get("language"))
+        if languages:
+            data["spokenLanguages"] = [{"name": name} for name in languages]
+            changed = True
+    return changed
+
+
+def wikipedia_candidates(data: dict) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+
+    def add(lang: str, title: str) -> None:
+        code = str(lang or "").lower().split("-")[0]
+        name = str(title or "").strip()
+        if not re.fullmatch(r"[a-z]{2,3}", code) or not name:
+            return
+        pair = (code, name)
+        if pair not in candidates:
+            candidates.append(pair)
+
+    add("ko", data.get("title"))
+    add("ko", data.get("originalTitle"))
+    add(data.get("originalLanguageCode"), data.get("originalTitle"))
+    add("en", data.get("originalTitle"))
+    add("en", data.get("title"))
+    return candidates[:5]
+
+
+def fetch_wikipedia(data: dict, cache: dict) -> dict | None:
+    """Return a Wikipedia REST summary for the first matching title candidate."""
+    for lang, title in wikipedia_candidates(data):
+        cache_key = f"wikipedia:{lang}:{title}"
+        cached = cache.get(cache_key)
+        if cached and time.time() - cached.get("ts", 0) < WIKIPEDIA_CACHE_TTL:
+            result = cached.get("data")
+        else:
+            encoded = urllib.parse.quote(title.replace(" ", "_"), safe="")
+            url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{encoded}?redirect=true"
+            payload = http_json(url, headers={"Accept": "application/json"},
+                                timeout=15, retries=1, quiet=True)
+            result = None
+            if payload and payload.get("type") != "disambiguation" and payload.get("extract"):
+                content_urls = payload.get("content_urls") or {}
+                desktop = content_urls.get("desktop") or {}
+                result = {
+                    "lang": lang,
+                    "title": payload.get("title") or title,
+                    "url": desktop.get("page") or "",
+                    "description": payload.get("description") or "",
+                    "extract": payload.get("extract"),
+                }
+            # 실패/불일치 결과는 캐시하지 않는다. 일시적 오류가 7일 동안 굳지 않게 한다.
+            if result:
+                cache[cache_key] = {"ts": time.time(), "data": result}
+        if result:
+            return result
+    return None
+
+
+def merge_wikipedia(data: dict, wiki: dict | None) -> bool:
+    if not wiki:
+        return False
+    changed = False
+    info = {key: wiki.get(key) for key in ("lang", "title", "url", "description")}
+    if data.get("wikipedia") != info:
+        data["wikipedia"] = info
+        changed = True
+    if not data.get("overview") and wiki.get("extract"):
+        data["overview"] = wiki["extract"]
         changed = True
     return changed
 
@@ -503,16 +664,25 @@ def run_batch(input_dir: Path, out_dir: Path, cache_dir: Path, cache: dict, args
             if merge_wikidata(data, info):
                 changed_by_file[path].add("wikidata")
 
-    if args.omdb_key and args.omdb_key.strip():
+    omdb_key = (args.omdb_key or "").strip() or read_omdb_key_file()
+    if omdb_key:
         for path, data, kind in loaded:
             if data.get("type") == "person" or kind == "person":
                 continue
-            omdb = fetch_omdb(args.omdb_key.strip(), data, kind, cache)
+            omdb = fetch_omdb(omdb_key, data, kind, cache)
             if omdb:
                 if merge_omdb(data, omdb):
                     changed_by_file[path].add("omdb")
                 if args.omdb_delay > 0:
                     time.sleep(args.omdb_delay)
+
+    if not args.no_wikipedia:
+        for path, data, kind in loaded:
+            if kind == "person" or data.get("overview"):
+                continue
+            wiki = fetch_wikipedia(data, cache)
+            if merge_wikipedia(data, wiki):
+                changed_by_file[path].add("wikipedia")
 
     if args.imdb_dir:
         needed = set()
@@ -634,6 +804,7 @@ def main() -> int:
     parser.add_argument("--inplace", action="store_true", help="Overwrite input files")
     parser.add_argument("--no-backup", action="store_true", help="Do not create .json.bak when using --inplace")
     parser.add_argument("--no-wikidata", action="store_true", help="Skip Wikidata enrichment")
+    parser.add_argument("--no-wikipedia", action="store_true", help="Skip Wikipedia summary enrichment")
     parser.add_argument("--wikidata-delay", type=float, default=1.0, help="Delay between Wikidata batches (seconds)")
     parser.add_argument("--omdb-key", default=os.environ.get("OMDB_API_KEY", ""), help="OMDb API key (or OMDB_API_KEY)")
     parser.add_argument("--omdb-delay", type=float, default=0.25, help="Delay between OMDb requests (seconds)")

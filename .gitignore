@@ -7,6 +7,7 @@ __pycache__/
 crawl-log-*.log
 *.json.bak
 enriched/
+OMDb API.txt
 native/*.exe
 native/launcher.ini
 native/com.tmdb_json_extractor.enricher.json

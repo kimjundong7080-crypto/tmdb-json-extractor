@@ -7,6 +7,7 @@
 
   const STATE_KEY = 'tmdbCrawlerState';
   const SETTINGS_KEY = 'tmdbCrawlerSettings';
+  const OMDB_KEY_FILE_NAME = 'OMDb API.txt';
   const SETTINGS_HASH_KEY = 'tmdbCrawlerSettingsHash';
   const STATE_VERSION = 2;
   const MAX_QUEUE = 3000;
@@ -84,7 +85,9 @@
     // OMDb 보강용 API 키 (선택). chrome.storage에만 저장하고 settings.json에는 쓰지 않는다.
     omdbApiKey: '',
     // Wikidata 보조 데이터(회사·국가·언어·IMDb ID) 수집 여부
-    useWikidata: true
+    useWikidata: true,
+    // Wikipedia 요약으로 빈 개요를 보완할지 여부
+    useWikipedia: true
   };
 
   const state = {
@@ -674,6 +677,22 @@
     return new Promise(resolve => {
       try {
         chrome.runtime.sendMessage({ action: 'crawlerPackagedSettings' }, response => {
+          if (chrome.runtime.lastError) {
+            resolve(null);
+            return;
+          }
+          resolve(response && typeof response === 'object' ? response : null);
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  function requestOmdbKeyFile() {
+    return new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ action: 'crawlerOmdbKeyFile' }, response => {
           if (chrome.runtime.lastError) {
             resolve(null);
             return;
@@ -1517,6 +1536,7 @@
       videos: true,
       releases: true,
       wikidata: settings.useWikidata !== false,
+      wikipedia: settings.useWikipedia !== false,
       allLanguages: settings.allLanguages === true,
       omdbApiKey: settings.omdbApiKey || ''
     });
@@ -1970,6 +1990,38 @@
     return { ok: true };
   }
 
+  // 패널의 [API 테스트] → 입력한 OMDb 키로 샘플 작품을 조회해 유효성을 확인한다.
+  function testOmdbKey() {
+    const input = panel && panel.querySelector('[data-opt="omdbApiKey"]');
+    const key = String(input ? input.value : settings.omdbApiKey || '').trim();
+    if (!key) {
+      toast('❌ OMDb API 키를 먼저 입력하세요.', 'error');
+      return;
+    }
+
+    // 입력한 키를 바로 저장해 테스트와 실제 수집이 같은 값을 쓰게 한다.
+    settings.omdbApiKey = key;
+    saveSettings();
+    toast('⏳ OMDb API 확인 중...');
+
+    chrome.runtime.sendMessage({ action: 'testOmdbKey', apiKey: key }, response => {
+      if (chrome.runtime.lastError) {
+        toast('❌ OMDb 테스트 실패: ' + chrome.runtime.lastError.message, 'error');
+        return;
+      }
+      if (response && response.ok) {
+        const detail = [response.title, response.year, response.rating ? '★' + response.rating : '']
+          .filter(Boolean).join(' · ');
+        log('OMDb', 'API 테스트 성공: ' + detail);
+        toast('✅ OMDb API 정상: ' + detail);
+      } else {
+        const message = (response && response.error) || '알 수 없는 오류';
+        log('OMDb', 'API 테스트 실패: ' + message);
+        toast('❌ OMDb API 실패: ' + message, 'error');
+      }
+    });
+  }
+
   // 패널의 [Python 보강 실행] → background에 네이티브 호스트 실행을 요청한다.
   function runPythonEnricher() {
     return new Promise(resolve => {
@@ -2037,6 +2089,7 @@
     next.autoLog = true;
     next.omdbApiKey = String(next.omdbApiKey || '').trim();
     next.useWikidata = next.useWikidata !== false;
+    next.useWikipedia = next.useWikipedia !== false;
     return next;
   }
 
@@ -2070,7 +2123,7 @@
 
   async function exportIndex() {
     const index = {
-      schemaVersion: '1.7',
+      schemaVersion: '1.7.4',
       exportedAt: new Date().toISOString(),
       startedAt: state.startedAt,
       elapsed: formatElapsed(crawlTimeMs()),
@@ -2205,8 +2258,10 @@
           </label>
           <label><input type="checkbox" data-opt="allLanguages"> 모든 언어 포스터/배경 (끄면 1개 언어)</label>
           <label><input type="checkbox" data-opt="useWikidata"> Wikidata 보조 데이터 수집 (회사·국가·언어·IMDb ID)</label>
+          <label><input type="checkbox" data-opt="useWikipedia"> Wikipedia 요약 보강 (빈 개요·줄거리 보완)</label>
           <label style="display:flex;align-items:center;gap:6px">OMDb API 키
             <input type="password" data-opt="omdbApiKey" placeholder="선택 · 확장 저장소에만 저장" autocomplete="off" style="width:150px;background:#1e1e30;color:#e9e9f2;border:1px solid #3a3a5c;border-radius:6px;padding:2px 4px">
+            <button data-crawl="omdbTest" title="입력한 키로 OMDb 샘플 작품(tt3896198)을 조회합니다" style="padding:2px 8px;border-radius:6px;border:1px solid #3a3a5c;background:#1e1e30;color:#9bb8ff;cursor:pointer">API 테스트</button>
           </label>
           <label><input type="checkbox" data-opt="collectFilmography"> 인물 필모그래피 작품 수집</label>
           <label style="display:flex;align-items:center;gap:6px;padding-left:18px">작품당 인물
@@ -2256,6 +2311,7 @@
       if (button) {
         const action = button.getAttribute('data-crawl');
         if (action === 'python') runPythonEnricher();
+        else if (action === 'omdbTest') testOmdbKey();
         else if (action === 'start') startCrawl(true);
         else if (action === 'pause') togglePause();
         else if (action === 'stop') stopCrawl();
@@ -2469,6 +2525,21 @@
       } catch (error) {
         log('설정 자동 불러오기 실패', errorMessage(error));
       }
+    }
+
+    // 확장 폴더의 OMDb API.txt가 있으면 매 페이지 시작 시 키를 다시 읽어 항상 우선 적용한다.
+    const omdbKeyFile = await requestOmdbKeyFile();
+    if (omdbKeyFile && omdbKeyFile.key) {
+      if (settings.omdbApiKey !== omdbKeyFile.key) {
+        settings.omdbApiKey = omdbKeyFile.key;
+        await saveSettings();
+        log('OMDb', '키 파일 적용: ' + OMDB_KEY_FILE_NAME);
+      }
+    } else if (omdbKeyFile && omdbKeyFile.exists && !settings.omdbApiKey) {
+      log('OMDb', '키 파일에 유효한 키가 없습니다: ' + OMDB_KEY_FILE_NAME);
+    } else if (omdbKeyFile && !omdbKeyFile.exists && !settings.omdbApiKey) {
+      log('OMDb', '키 파일을 읽지 못했습니다: ' + OMDB_KEY_FILE_NAME +
+        (omdbKeyFile.error ? ' (' + omdbKeyFile.error + ')' : ''));
     }
 
     pruneQueue();

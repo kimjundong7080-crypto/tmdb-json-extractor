@@ -953,7 +953,9 @@ async function fetchGalleryUrls(kind, basePath, options) {
       reportEnrichmentIssue(`TMDB ${kind} 언어 목록 수집 실패`, error);
     }
 
-    const MAX_EXTRA_LANGUAGES = 30;
+    // 포스터가 많은 작품은 언어 필터가 35개 이상이다. 상한이 낮으면 희소 언어의
+    // 이미지가 빠져 collected < totals(예: 469/473)가 되므로 넉넉히 순회한다.
+    const MAX_EXTRA_LANGUAGES = 60;
     let extra = 0;
     for (const pair of pairs) {
       if (recordCount() >= targetCount || extra >= MAX_EXTRA_LANGUAGES) break;
@@ -970,6 +972,13 @@ async function fetchGalleryUrls(kind, basePath, options) {
       } catch (error) {
         reportEnrichmentIssue(`TMDB ${kind} 갤러리 수집 실패 (${pair.code})`, error);
       }
+    }
+
+    if (recordCount() < targetCount) {
+      reportEnrichmentIssue(
+        `TMDB ${kind} 갤러리 미완료`,
+        `${recordCount()}/${targetCount} (추가 언어 ${extra}개 순회)`
+      );
     }
   }
 
@@ -1351,6 +1360,39 @@ async function fetchReleases(basePath) {
   return releases;
 }
 
+// 페이지에 표시된 원어 이름(영문/한글)을 ISO 639-1 코드로 보완한다.
+// Wikidata에 해당 작품이 없어도 원어 코드를 채울 수 있다.
+function languageCodeFromName(name) {
+  const value = String(name || '').trim().toLowerCase();
+  if (!value) return '';
+  const table = {
+    english: 'en', korean: 'ko', japanese: 'ja', german: 'de', french: 'fr',
+    spanish: 'es', italian: 'it', portuguese: 'pt', russian: 'ru', hindi: 'hi',
+    chinese: 'zh', 'mandarin chinese': 'zh', cantonese: 'zh', 'no language': '',
+    arabic: 'ar', dutch: 'nl', swedish: 'sv', danish: 'da', norwegian: 'no',
+    finnish: 'fi', polish: 'pl', turkish: 'tr', greek: 'el', hebrew: 'he',
+    czech: 'cs', hungarian: 'hu', thai: 'th', vietnamese: 'vi', indonesian: 'id',
+    ukrainian: 'uk', persian: 'fa', romanian: 'ro', bulgarian: 'bg', croatian: 'hr',
+    serbian: 'sr', slovak: 'sk', slovenian: 'sl', estonian: 'et', latvian: 'lv',
+    lithuanian: 'lt', icelandic: 'is', irish: 'ga', welsh: 'cy', catalan: 'ca',
+    basque: 'eu', galician: 'gl', albanian: 'sq', macedonian: 'mk', georgian: 'ka',
+    armenian: 'hy', azerbaijani: 'az', kazakh: 'kk', uzbek: 'uz', mongolian: 'mn',
+    nepali: 'ne', bengali: 'bn', tamil: 'ta', telugu: 'te', malayalam: 'ml',
+    kannada: 'kn', marathi: 'mr', gujarati: 'gu', punjabi: 'pa', sinhala: 'si',
+    khmer: 'km', lao: 'lo', burmese: 'my', malay: 'ms', tagalog: 'tl',
+    '영어': 'en', '한국어': 'ko', '일본어': 'ja', '독일어': 'de', '프랑스어': 'fr',
+    '스페인어': 'es', '이탈리아어': 'it', '포르투갈어': 'pt', '러시아어': 'ru',
+    '중국어': 'zh', '광둥어': 'zh', '아랍어': 'ar', '네덜란드어': 'nl',
+    '스웨덴어': 'sv', '덴마크어': 'da', '노르웨이어': 'no', '핀란드어': 'fi',
+    '폴란드어': 'pl', '터키어': 'tr', '그리스어': 'el', '히브리어': 'he',
+    '체코어': 'cs', '헝가리어': 'hu', '태국어': 'th', '베트남어': 'vi',
+    '인도네시아어': 'id', '우크라이나어': 'uk', '페르시아어': 'fa',
+    '루마니아어': 'ro', '불가리아어': 'bg', '크로아티아어': 'hr',
+    '세르비아어': 'sr', '슬로바키아어': 'sk', '슬로베니아어': 'sl'
+  };
+  return table.hasOwnProperty(value) ? table[value] : '';
+}
+
 function getTmdbWikidataProperty(kind) {
   if (kind === 'tv') return 'P4983';
   if (kind === 'person') return 'P4985';
@@ -1526,11 +1568,125 @@ async function fetchOmdb(apiKey, page, data) {
   return result;
 }
 
+function splitOmdbList(value) {
+  return String(value || '')
+    .split(/\s*,\s*/)
+    .map(item => item.trim())
+    .filter(item => item && item !== 'N/A');
+}
+
+// OMDb의 "142 min"을 TMDB 표기("2h 22m")로 맞춘다. 같은 필드에 두 형식이 섞이지 않게 한다.
+function formatRuntimeMinutes(value) {
+  const match = String(value || '').match(/\d+/);
+  const total = match ? Number(match[0]) : 0;
+  if (!total) return '';
+  const hours = Math.floor(total / 60);
+  const minutes = total % 60;
+  if (hours && minutes) return hours + 'h ' + minutes + 'm';
+  if (hours) return hours + 'h';
+  return minutes + 'm';
+}
+
 function mergeOmdb(data, omdb) {
   if (!omdb) return;
   data.omdb = omdb;
   if (!data.imdbId && omdb.imdbID) data.imdbId = omdb.imdbID;
   if (!data.overview && omdb.plot) data.overview = omdb.plot;
+
+  // TMDB 페이지에 없는 항목을 OMDb로 보강한다. 이미 값이 있으면 TMDB 값을 우선한다.
+  if (!data.certification && omdb.rated && omdb.rated !== 'N/A') data.certification = omdb.rated;
+  if (!data.homepage && omdb.website && omdb.website !== 'N/A') data.homepage = omdb.website;
+  if (!data.runtime) {
+    const runtime = formatRuntimeMinutes(omdb.runtime);
+    if (runtime) data.runtime = runtime;
+  }
+  if (!Array.isArray(data.genres)) data.genres = [];
+  if (!Array.isArray(data.productionCompanies)) data.productionCompanies = [];
+  if (!Array.isArray(data.productionCountries)) data.productionCountries = [];
+  if (!Array.isArray(data.spokenLanguages)) data.spokenLanguages = [];
+  if (data.genres.length === 0) {
+    splitOmdbList(omdb.genre).forEach(name => data.genres.push(name));
+  }
+  if (data.productionCompanies.length === 0) {
+    splitOmdbList(omdb.production).forEach(name => data.productionCompanies.push({ name: name }));
+  }
+  if (data.productionCountries.length === 0) {
+    splitOmdbList(omdb.country).forEach(name => data.productionCountries.push({ name: name }));
+  }
+  if (data.spokenLanguages.length === 0) {
+    splitOmdbList(omdb.language).forEach(name => data.spokenLanguages.push({ name: name }));
+  }
+}
+
+const WIKIPEDIA_CACHE_TTL = 30 * 60 * 1000;
+
+// 제목 후보를 페이지 언어 → 원어 → 영어 순으로 만든다(최대 5회 요청).
+function wikipediaCandidates(data) {
+  const list = [];
+  const add = (lang, title) => {
+    const code = String(lang || '').toLowerCase().split('-')[0];
+    const name = String(title || '').trim();
+    if (!/^[a-z]{2,3}$/.test(code) || !name) return;
+    if (list.some(candidate => candidate.lang === code && candidate.title === name)) return;
+    list.push({ lang: code, title: name });
+  };
+  const locale = String(pageLocale() || 'ko-KR').split('-')[0];
+  add(locale, data.title);
+  add(locale, data.originalTitle);
+  add(data.originalLanguageCode, data.originalTitle);
+  add('en', data.originalTitle);
+  add('en', data.title);
+  return list.slice(0, 5);
+}
+
+async function fetchWikipediaSummary(candidate) {
+  if (!candidate || !candidate.title) return null;
+  if (!window.__tmdbWikipediaCache) window.__tmdbWikipediaCache = {};
+  const cache = window.__tmdbWikipediaCache;
+  const cacheKey = candidate.lang + ':' + candidate.title;
+  const cached = cache[cacheKey];
+  if (cached && (Date.now() - cached.ts) < WIKIPEDIA_CACHE_TTL) return cached.data;
+
+  const url = `https://${candidate.lang}.wikipedia.org/api/rest_v1/page/summary/` +
+    encodeURIComponent(candidate.title.replace(/\s+/g, ' ')) + '?redirect=true';
+  const response = await fetchWithTimeout(url, { credentials: 'omit' }, 8000);
+  if (!response.ok) return null;
+  const json = await response.json();
+  if (!json || json.type === 'disambiguation' || !json.extract) return null;
+
+  const result = {
+    lang: candidate.lang,
+    title: json.title || candidate.title,
+    url: (json.content_urls && json.content_urls.desktop && json.content_urls.desktop.page) || '',
+    description: json.description || '',
+    extract: String(json.extract)
+  };
+  cache[cacheKey] = { ts: Date.now(), data: result };
+  return result;
+}
+
+async function fetchWikipediaEnrichment(data) {
+  for (const candidate of wikipediaCandidates(data)) {
+    try {
+      const summary = await fetchWikipediaSummary(candidate);
+      if (summary) return summary;
+    } catch (error) {
+      // 한 언어판 요청이 실패해도 다음 후보(다른 언어판)를 계속 시도한다.
+      reportEnrichmentIssue(`Wikipedia 요약 실패 (${candidate.lang})`, error);
+    }
+  }
+  return null;
+}
+
+function mergeWikipedia(data, wiki) {
+  if (!wiki) return;
+  data.wikipedia = {
+    lang: wiki.lang,
+    title: wiki.title,
+    url: wiki.url,
+    description: wiki.description
+  };
+  if (!data.overview && wiki.extract) data.overview = wiki.extract;
 }
 
 async function enrichMediaData(data, options) {
@@ -1586,8 +1742,8 @@ async function enrichMediaData(data, options) {
     })());
   }
 
-  // Wikidata로 IMDb ID를 먼저 확보한 뒤 OMDb를 호출한다(같은 작업 안에서 순차 실행).
-  if (options.wikidata || options.omdbApiKey) {
+  // Wikidata → OMDb → Wikipedia 순으로 순차 실행한다(앞 단계가 채운 값은 덮어쓰지 않음).
+  if (options.wikidata || options.omdbApiKey || options.wikipedia !== false) {
     tasks.push((async () => {
       if (options.wikidata) {
         try {
@@ -1601,6 +1757,13 @@ async function enrichMediaData(data, options) {
           mergeOmdb(data, await fetchOmdb(options.omdbApiKey, page, data));
         } catch (error) {
           reportEnrichmentIssue('OMDb 보강 실패', error);
+        }
+      }
+      if (options.wikipedia !== false && !data.overview) {
+        try {
+          mergeWikipedia(data, await fetchWikipediaEnrichment(data));
+        } catch (error) {
+          reportEnrichmentIssue('Wikipedia 보강 실패', error);
         }
       }
     })());
@@ -1964,6 +2127,7 @@ async function extractMediaData(options = {}) {
     imdbId: '',
     omdb: null,
     wikidata: null,
+    wikipedia: null,
     images: {
       posters: [],
       backdrops: [],
@@ -1975,6 +2139,7 @@ async function extractMediaData(options = {}) {
     seasons: [],
     networks: [],
     type: '',
+    mediaType: isTV ? 'tv' : 'movie',
     originalLanguage: '',
     originalLanguageCode: '',
     keywords: [],
@@ -1992,7 +2157,7 @@ async function extractMediaData(options = {}) {
     releases: [],
     statusKey: '',
     isComplete: false,
-    schemaVersion: '1.7.2',
+    schemaVersion: '1.7.4',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -2739,6 +2904,11 @@ async function extractMediaData(options = {}) {
       const imdbLink = document.querySelector('a[href*="imdb.com/title/tt"]');
       const imdbMatch = String(imdbLink ? imdbLink.getAttribute('href') : '').match(/imdb\.com\/title\/(tt\d+)/);
       if (imdbMatch) data.imdbId = imdbMatch[1];
+    }
+
+    // 페이지의 원어 이름으로 코드를 보완한다(Wikidata에 작품이 없을 때).
+    if (!data.originalLanguageCode && data.originalLanguage) {
+      data.originalLanguageCode = languageCodeFromName(data.originalLanguage);
     }
 
     // ===== 11. 수집 범위/정합성 메타 =====

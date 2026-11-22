@@ -187,6 +187,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // 확장 폴더의 OMDb API.txt에서 키를 읽는다(매 페이지 시작 시 항상 적용).
+  if (message.action === "crawlerOmdbKeyFile") {
+    loadOmdbKeyFile()
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ exists: false, key: "", error: String((error && error.message) || error) }));
+    return true;
+  }
+
+  // OMDb API 키 테스트: service worker가 대신 호출해 CORS/권한 문제를 피한다.
+  if (message.action === "testOmdbKey") {
+    testOmdbKey(message)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ ok: false, error: String((error && error.message) || error) }));
+    return true;
+  }
+
   // 사이트맵 프록시: files.tmdb.org는 TMDB와 다른 origin이라 content script에서 직접 못 읽는다.
   // host_permissions를 가진 service worker가 대신 받아 gzip을 풀고 필요한 부분만 돌려준다.
   if (message.action === "crawlFetch") {
@@ -315,6 +331,31 @@ async function handleCrawlerImage(message) {
   });
 }
 
+// OMDb API 키가 실제로 동작하는지 확인한다. 샘플 작품(tt3896198)으로 조회한다.
+async function testOmdbKey(message) {
+  const apiKey = String(message.apiKey || "").trim();
+  if (!apiKey) return { ok: false, error: "API 키가 비어 있습니다" };
+
+  try {
+    const url = "https://www.omdbapi.com/?apikey=" + encodeURIComponent(apiKey) + "&i=tt3896198";
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) return { ok: false, error: "HTTP " + response.status };
+    const json = await response.json();
+    if (String(json.Response) !== "True") {
+      return { ok: false, error: json.Error || "OMDb 응답 실패" };
+    }
+    return {
+      ok: true,
+      title: json.Title || "",
+      year: json.Year || "",
+      imdbId: json.imdbID || "",
+      rating: json.imdbRating || ""
+    };
+  } catch (error) {
+    return { ok: false, error: String((error && error.message) || error) };
+  }
+}
+
 // 설치 폴더의 settings.json은 읽기만 가능하다(Chrome이 확장 폴더 쓰기를 막는다).
 // 파일이 바뀌었는지 비교할 수 있도록 내용 해시도 함께 돌려준다.
 function hashString(value) {
@@ -335,6 +376,60 @@ async function loadPackagedSettings() {
   } catch (e) {
     return null;
   }
+}
+
+// 확장 폴더의 OMDb API.txt에서 키를 읽는다. 파일이 없거나 키가 없으면 빈 값을 돌려준다.
+const OMDB_KEY_FILE = "OMDb API.txt";
+
+function parseOmdbKeyText(text) {
+  const raw = String(text || "").replace(/^\uFEFF/, "").trim();
+  if (!raw) return "";
+
+  // JSON(OMDb 응답 저장본 등)이면 apikey 필드만 인정한다. 본문 단어를 키로 오인하지 않는다.
+  if (raw.startsWith("{") || raw.startsWith("[")) {
+    try {
+      const data = JSON.parse(raw);
+      if (data && typeof data === "object") {
+        for (const name of ["apikey", "apiKey", "api_key", "key"]) {
+          const value = typeof data[name] === "string" ? data[name].trim() : "";
+          if (/^[A-Za-z0-9]{6,32}$/.test(value)) return value;
+        }
+      }
+    } catch (e) {}
+    return "";
+  }
+
+  const line = raw.split(/\r?\n/).map(value => value.trim()).find(Boolean) || "";
+  const urlMatch = line.match(/[?&]apikey=([A-Za-z0-9]{6,32})/i);
+  if (urlMatch) return urlMatch[1];
+  // "apikey=abcd1234", "API Key: abcd1234", 또는 키만 있는 줄
+  const afterSeparator = line.split(/[:=]/).pop().trim().replace(/^["']|["']$/g, "");
+  const match = afterSeparator.match(/[A-Za-z0-9]{6,32}/);
+  return match ? match[0] : "";
+}
+
+async function loadOmdbKeyFile() {
+  // 파일 이름에 공백이 있어 URL 인코딩 방식에 따라 읽기가 실패할 수 있으므로 순서대로 시도한다.
+  const candidates = [
+    chrome.runtime.getURL(OMDB_KEY_FILE),
+    encodeURI(chrome.runtime.getURL(OMDB_KEY_FILE)),
+    chrome.runtime.getURL(encodeURIComponent(OMDB_KEY_FILE))
+  ];
+  let lastError = "";
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        lastError = "HTTP " + response.status;
+        continue;
+      }
+      const text = await response.text();
+      return { exists: true, key: parseOmdbKeyText(text) };
+    } catch (error) {
+      lastError = String((error && error.message) || error);
+    }
+  }
+  return { exists: false, key: "", error: lastError };
 }
 
 // 사이트맵 한 파일은 5만 URL/5.7MB라서 매 배치마다 다시 받으면 낭비다.

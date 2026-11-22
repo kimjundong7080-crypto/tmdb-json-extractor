@@ -886,3 +886,98 @@ section wins.
 4. Add automated tests for pure `content.js` helpers and `enrich.py` merge functions.
 5. Consider a local FastAPI mode if native messaging proves inconvenient; the Python CLI core
    is reusable.
+
+## Crawl audit — `C:/Users/ssii/Downloads/tmdb` (2026-11-22, schema 1.7.3)
+
+Re-audited the four crawled files (`movie-6`, `movie-8`, `movie-9`, `movie-11`). `index.json`
+was absent from this run (the crawl did not export it).
+
+### Fixes
+
+1. **`mediaType` added**: `type` was empty in every movie JSON (only the TV facts block set it,
+   to a label such as "Scripted"). The media payload now carries `mediaType: "movie" | "tv"`
+   and its `schemaVersion` is `1.7.3`; person payloads stay `1.7.2` (shape unchanged).
+2. **Gallery completeness**: `movie-11` collected 469/473 posters because the extra-language
+   sweep stopped at `MAX_EXTRA_LANGUAGES = 30` while TMDB exposes 35 language filters; the
+   remaining low-count languages hold the missing images. Raised the cap to 60 and added a
+   `TMDB <kind> 갤러리 미완료` warning when the tab total is still not reached, so a shortfall is
+   visible in the crawl log instead of silent.
+
+### Confirmed data absence (not bugs)
+
+- `movie-8`: TMDB shows only 상태/원어/제작비/수익 facts, no company or language links, no Top
+  Billed cards. Wikidata has neither `P4947 = 8` nor `P345 = tt0825671` (verified by SPARQL),
+  so empty `productionCompanies`/`spokenLanguages`/`wikidata` are source absences.
+- `movie-9`: TMDB has no image library for this title (no Media panel), so 0 posters/backdrops
+  is correct.
+- `movie-6`: crew 19 vs `crewTotal` 18 is expected because combined roles are split into
+  separate entries.
+
+### Re-crawl needed
+
+Existing files keep their old payloads. Reload the extension, clear `방문기록`, and re-crawl
+`movie-11` (and any others) to get `mediaType` and the full poster set, then re-export
+`index.json`. OMDb is already populated on all four files, so the key file works.
+
+## Wikipedia + OMDb gap filling (2026-11-22, media schema 1.7.4)
+
+`manifest.json` is 1.7.3 and adds `https://*.wikipedia.org/*` to `host_permissions`. Media
+payloads are `schemaVersion 1.7.4`; `index.json` exports `1.7.4`.
+
+### OMDb now fills top-level fields (extension + Python)
+
+`mergeOmdb` / `merge_omdb` fill only empty values, so TMDB-localized data always wins:
+
+| Payload field | OMDb source |
+| --- | --- |
+| `certification` | `Rated` (skips `N/A`) |
+| `homepage` | `Website` |
+| `runtime` | `Runtime` (`"79 min"` → `"1h 19m"`, same format as TMDB) |
+| `genres[]` | `Genre` (comma split) |
+| `productionCompanies[]` | `Production` |
+| `productionCountries[]` | `Country` |
+| `spokenLanguages[]` | `Language` |
+| `overview` | `Plot` (already existed) |
+
+OMDb values are English, so a filled field can mix with TMDB's localized values; it is a
+fallback only.
+
+### Wikipedia summary enrichment
+
+- `content.js`: `fetchWikipediaEnrichment` tries `ko` (page locale), the original language, then
+  `en`, using the REST summary endpoint
+  `https://<lang>.wikipedia.org/api/rest_v1/page/summary/<title>?redirect=true`. It runs only
+  when `overview` is still empty after Wikidata/OMDb, skips disambiguation pages, caches for
+  30 min, and stores `wikipedia: { lang, title, url, description }` (the extract becomes
+  `overview`). Verified CORS is `access-control-allow-origin: *`.
+- Toggle: `useWikipedia` (default `true`) in `crawler.js` defaults, `normalizeSettings`, the
+  extraction options, and the panel checkbox `Wikipedia 요약 보강`.
+- `python/enrich.py`: same candidates and merge for media files with an empty `overview`, cached
+  7 days, disabled with `--no-wikipedia`. Person files are skipped. Only successful lookups are
+  cached, so a transient failure is retried on the next run instead of sticking for 7 days.
+- `fetchWikipediaEnrichment` keeps trying the remaining language candidates when one request
+  throws; it no longer aborts the whole chain on the first network error.
+- `mergeOmdb` (JS) normalizes `Runtime` through `formatRuntimeMinutes` and guards
+  `genres`/`productionCompanies`/`productionCountries`/`spokenLanguages` with `Array.isArray`,
+  matching Python's `format_runtime_minutes` and `data.get(...)` checks.
+
+### Verification
+
+- JS harness: OMDb fills empty fields, never overwrites TMDB values, Wikipedia candidate order
+  and merge behavior. Python harness: same fills plus mocked fallback ko→en, metadata object,
+  negative-cache reuse. Both passed; `node --check` and `py -m py_compile` pass.
+- Live checks: OMDb `tt0825671` returns `Country Austria`, `Language English, Hindi, ...`,
+  `Production Paul Thiltges Distributions`, `Rated N/A`; Korean Wikipedia summary for
+  `스타워즈 에피소드 4: 새로운 희망` returns a standard page with an extract.
+- Applied to the existing output:
+  `py python/enrich.py "C:/Users/ssii/Downloads/tmdb" --inplace` wrote all 6 media files
+  (`movie-13` … `movie-18`) with source `omdb` and left `.json.bak` backups. TMDB values were
+  preserved, e.g. `citizen-kane` keeps `certification: "NR"` although OMDb says `PG`, and
+  every `runtime` stayed in TMDB's `2h 22m` form. An isolated copy with blanked
+  `certification`/`homepage`/`runtime`/`genres`/countries/languages was filled from OMDb
+  (`R`, `1h 33m`, `Drama/Fantasy/Horror`, 4 countries, 2 languages), proving the fill path.
+  Wikidata returned HTTP 429 for the batch and contributed nothing — expected, and the empty
+  result is no longer cached, so the next run retries it.
+- **Not verified**: a real crawl with the reloaded extension (no `chrome://extensions` access
+  here), so `mediaType`, the 60-language gallery cap, and in-page Wikipedia/OMDb enrichment were
+  not exercised against live TMDB pages.
