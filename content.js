@@ -73,7 +73,11 @@ async function handleExtraction(kind, sendResponse) {
       prefix = 'person';
       successMessage = `✅ 배우 "${data.name}" 정보가 클립보드에 복사되었습니다!`;
     } else {
-      const data = extractMediaData();
+      const data = await extractMediaData(
+        kind === 'cast'
+          ? { cast: true }
+          : { galleries: true, cast: true, videos: true, releases: true, wikidata: true }
+      );
 
       if (kind === 'cast') {
         const castList = (data.credits && Array.isArray(data.credits.cast)) ? data.credits.cast : [];
@@ -194,6 +198,7 @@ function downloadJsonFile(jsonString, filename, prefix, id) {
 // ===== 이미지 고해상도 변환 함수 =====
 function getHighResImage(url, size = 'high') {
   if (!url) return url;
+  url = normalizeImageUrl(url);
   if (!url.includes('media.themoviedb.org')) return url;
   
   const sizeMap = {
@@ -255,10 +260,10 @@ function getImageSource(img) {
         bestUrl = url;
       }
     });
-    if (bestUrl) return bestUrl;
+    if (bestUrl) return normalizeImageUrl(bestUrl);
   }
 
-  return img.getAttribute('data-src') || img.getAttribute('src') || '';
+  return normalizeImageUrl(img.getAttribute('data-src') || img.getAttribute('src') || '');
 }
 
 // ===== 숫자/상태 정규화 헬퍼 =====
@@ -308,6 +313,436 @@ function dedupeImagesByFilename(items) {
   });
 
   return order.map(name => byName[name]);
+}
+
+// ===== TMDB 하위 페이지/이미지 헬퍼 =====
+function normalizeImageUrl(url) {
+  if (!url) return '';
+  return String(url)
+    .replace('://image.tmdb.org/', '://media.themoviedb.org/')
+    .split('?')[0];
+}
+
+function replaceImageSize(url, token) {
+  const normalized = normalizeImageUrl(url);
+  const match = normalized.match(/\/t\/p\/([^/]+)\//);
+  if (!match) return normalized;
+  return normalized.replace(`/t/p/${match[1]}/`, `/t/p/${token}/`);
+}
+
+function getImageFilename(url) {
+  return normalizeImageUrl(url).split('/').pop();
+}
+
+function buildImageVariants(originalUrl, displayToken, highToken) {
+  return {
+    display: replaceImageSize(originalUrl, displayToken),
+    high: replaceImageSize(originalUrl, highToken),
+    original: replaceImageSize(originalUrl, 'original')
+  };
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getFetchCache() {
+  if (!window.__tmdbFetchCache) window.__tmdbFetchCache = {};
+  return window.__tmdbFetchCache;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || 8000);
+  try {
+    return await fetch(url, Object.assign({ credentials: 'same-origin' }, options, { signal: controller.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchHtmlDoc(path, timeoutMs) {
+  const cache = getFetchCache();
+  const cached = cache[path];
+  if (cached && (Date.now() - cached.ts) < 10 * 60 * 1000) {
+    return new DOMParser().parseFromString(cached.html, 'text/html');
+  }
+
+  const response = await fetchWithTimeout(path, {}, timeoutMs);
+  if (!response.ok) throw new Error(`HTTP ${response.status} (${path})`);
+  const html = await response.text();
+  cache[path] = { ts: Date.now(), html: html };
+  return new DOMParser().parseFromString(html, 'text/html');
+}
+
+async function fetchGalleryUrls(kind, basePath) {
+  const variants = kind === 'posters'
+    ? ['', '?image_language=xx', '?image_language=en']
+    : ['', '?image_language=en'];
+
+  const seen = {};
+  const urls = [];
+
+  for (const variant of variants) {
+    try {
+      const doc = await fetchHtmlDoc(`${basePath}/images/${kind}${variant}`);
+      doc.querySelectorAll('.card a[href*="/t/p/"]').forEach(anchor => {
+        const href = normalizeImageUrl(anchor.getAttribute('href'));
+        const name = getImageFilename(href);
+        if (!href || !name || seen[name]) return;
+        seen[name] = true;
+        urls.push(href);
+      });
+    } catch (error) {
+      console.warn(`TMDB ${kind} 갤러리 수집 실패 (${variant || 'default'}):`, error);
+    }
+    await delay(120);
+  }
+
+  return urls;
+}
+
+function mergeGalleryImages(data, kind, urls) {
+  const isPoster = kind === 'posters';
+  const displayToken = isPoster ? 'w500' : 'w780';
+  const highToken = isPoster ? 'w780' : 'w1280';
+  const lists = isPoster
+    ? {
+        display: data.images.posters,
+        high: data.images.posters_high,
+        original: data.images.posters_original
+      }
+    : {
+        display: data.images.backdrops,
+        high: data.images.backdrops_high,
+        original: data.images.backdrops_original
+      };
+
+  urls.forEach(url => {
+    const variants = buildImageVariants(url, displayToken, highToken);
+    lists.display.push({ url: variants.display });
+    lists.high.push({ url: variants.high });
+    lists.original.push({ url: variants.original });
+  });
+
+  const dedupedDisplay = dedupeImagesByFilename(lists.display);
+  const dedupedHigh = dedupeImagesByFilename(lists.high);
+  const dedupedOriginal = dedupeImagesByFilename(lists.original);
+
+  if (isPoster) {
+    data.images.posters = dedupedDisplay;
+    data.images.posters_high = dedupedHigh;
+    data.images.posters_original = dedupedOriginal;
+  } else {
+    data.images.backdrops = dedupedDisplay;
+    data.images.backdrops_high = dedupedHigh;
+    data.images.backdrops_original = dedupedOriginal;
+  }
+}
+
+function getCrewDepartment(role) {
+  const roleLower = String(role || '').toLowerCase();
+  if (roleLower.includes('director')) return 'Directing';
+  if (roleLower.includes('creator')) return 'Creator';
+  if (roleLower.includes('writer') || roleLower.includes('screenplay') || roleLower.includes('story')) return 'Writing';
+  if (roleLower.includes('producer')) return 'Production';
+  if (roleLower.includes('cinematographer') || roleLower.includes('director of photography')) return 'Camera';
+  if (roleLower.includes('editor')) return 'Editing';
+  if (roleLower.includes('music') || roleLower.includes('composer')) return 'Sound';
+  if (roleLower.includes('art director') || roleLower.includes('production design')) return 'Art';
+  if (roleLower.includes('costume') || roleLower.includes('makeup') || roleLower.includes('hair')) return 'Costume & Make-Up';
+  if (roleLower.includes('visual effects') || roleLower.includes('vfx')) return 'Visual Effects';
+  return 'Other';
+}
+
+function normalizeDepartmentLabel(label) {
+  const text = String(label || '').trim();
+  const koreanMap = {
+    '미술': 'Art',
+    '카메라': 'Camera',
+    '의상 & 분장': 'Costume & Make-Up',
+    '제작진': 'Crew',
+    '연출': 'Directing',
+    '편집': 'Editing',
+    '조명': 'Lighting',
+    '제작': 'Production',
+    '음향': 'Sound',
+    '시각 효과': 'Visual Effects',
+    '각본': 'Writing'
+  };
+  if (koreanMap[text]) return koreanMap[text];
+
+  const english = ['Art', 'Camera', 'Costume & Make-Up', 'Crew', 'Directing', 'Editing', 'Lighting', 'Production', 'Sound', 'Visual Effects', 'Writing'];
+  return english.find(name => name.toLowerCase() === text.toLowerCase()) || '';
+}
+
+function findCastList(doc) {
+  const headings = Array.from(doc.querySelectorAll('h2, h3'));
+  const castHeading = headings.find(h => /출연진|^Cast\b/i.test(h.textContent.trim()));
+  if (castHeading && castHeading.nextElementSibling && castHeading.nextElementSibling.matches('ol.people')) {
+    return castHeading.nextElementSibling;
+  }
+  return doc.querySelector('ol.people.credits') || null;
+}
+
+async function fetchCastAndCrew(basePath) {
+  const doc = await fetchHtmlDoc(basePath + '/cast');
+  const castList = findCastList(doc);
+  const castNames = {};
+  const cast = [];
+
+  if (castList) {
+    castList.querySelectorAll('li').forEach(li => {
+      const nameLink = li.querySelector('.info p a, p a');
+      const name = nameLink ? nameLink.textContent.trim() : '';
+      if (!name || castNames[name]) return;
+      castNames[name] = true;
+
+      const characterEl = li.querySelector('p.character, .character');
+      const imageUrl = getImageSource(li.querySelector('img'));
+      cast.push({
+        name: name,
+        character: characterEl ? characterEl.textContent.trim() : '',
+        image: imageUrl ? replaceImageSize(imageUrl, 'w276_and_h350_face') : '',
+        image_high: imageUrl ? replaceImageSize(imageUrl, 'h632') : '',
+        image_original: imageUrl ? replaceImageSize(imageUrl, 'original') : '',
+        episodes: null
+      });
+    });
+  }
+
+  const crew = [];
+  doc.querySelectorAll('ol.people.crew').forEach(list => {
+    const heading = list.previousElementSibling;
+    const listedDepartment = normalizeDepartmentLabel(heading ? heading.textContent.trim() : '');
+
+    list.querySelectorAll('li').forEach(li => {
+      const nameLink = li.querySelector('.info p a, p a');
+      const name = nameLink ? nameLink.textContent.trim() : '';
+      if (!name || castNames[name]) return;
+
+      const jobEl = li.querySelector('p.episode_count_crew, p.character, .character');
+      const job = jobEl ? jobEl.textContent.trim() : '';
+      if (!job) return;
+
+      job.split(',').map(part => part.trim()).filter(Boolean).forEach(singleJob => {
+        if (crew.some(member => member.name === name && member.job === singleJob)) return;
+        crew.push({
+          name: name,
+          job: singleJob,
+          department: listedDepartment || getCrewDepartment(singleJob)
+        });
+      });
+    });
+  });
+
+  return { cast: cast, crew: crew };
+}
+
+function mergeCastAndCrew(data, fetched) {
+  fetched.cast.forEach(actor => {
+    if (data.credits.cast.some(existing => existing.name === actor.name)) return;
+    data.credits.cast.push(actor);
+  });
+
+  fetched.crew.forEach(member => {
+    if (data.credits.crew.some(existing => existing.name === member.name && existing.job === member.job)) return;
+    data.credits.crew.push(member);
+  });
+}
+
+async function fetchAllVideos(basePath, existingVideos) {
+  const doc = await fetchHtmlDoc(basePath + '/videos');
+  const videos = (existingVideos || []).slice();
+  const seen = {};
+  videos.forEach(video => { if (video.key) seen[video.key] = true; });
+
+  doc.querySelectorAll('.video.card, .video').forEach(card => {
+    const link = card.querySelector('a[data-id], [data-video-id]');
+    if (!link) return;
+
+    const key = link.getAttribute('data-id') || link.getAttribute('data-video-id');
+    if (!key || seen[key]) return;
+    seen[key] = true;
+
+    const titleEl = card.querySelector('h2 a, .title');
+    const title = (titleEl && titleEl.textContent.trim()) ||
+      link.getAttribute('data-title') || 'Video';
+    const site = link.getAttribute('data-site') || 'YouTube';
+
+    videos.push({
+      name: title,
+      url: `https://www.youtube.com/watch?v=${key}`,
+      site: site,
+      key: key
+    });
+  });
+
+  return videos;
+}
+
+async function fetchReleases(basePath) {
+  const doc = await fetchHtmlDoc(basePath + '/releases');
+  const releases = [];
+
+  doc.querySelectorAll('table.releases').forEach(table => {
+    const heading = table.querySelector('h2.release');
+    const country = heading ? heading.textContent.trim() : '';
+    const countryCode = heading ? (heading.getAttribute('id') || '') : '';
+
+    table.querySelectorAll('tbody tr').forEach(row => {
+      const cells = row.querySelectorAll('td');
+      if (cells.length < 4) return;
+      const date = cells[0].textContent.trim();
+      if (!date) return;
+
+      releases.push({
+        country: country,
+        countryCode: countryCode,
+        date: date,
+        certification: cells[1].textContent.trim(),
+        type: cells[2].textContent.trim(),
+        language: cells[3].textContent.trim(),
+        note: cells[4] ? cells[4].textContent.trim() : ''
+      });
+    });
+  });
+
+  return releases;
+}
+
+function getTmdbWikidataProperty(kind) {
+  if (kind === 'tv') return 'P4983';
+  if (kind === 'person') return 'P4985';
+  return 'P4947';
+}
+
+async function fetchWikidataEnrichment(page) {
+  if (!page || !page.id) return null;
+
+  if (!window.__tmdbWikidataCache) window.__tmdbWikidataCache = {};
+  const cache = window.__tmdbWikidataCache;
+  const cacheKey = `${page.kind}:${page.id}`;
+  const cached = cache[cacheKey];
+  if (cached && (Date.now() - cached.ts) < 30 * 60 * 1000) return cached.data;
+
+  const property = getTmdbWikidataProperty(page.kind);
+  const query = `SELECT ?companyLabel ?countryLabel ?languageLabel ?iso WHERE {
+    ?item wdt:${property} "${page.id}".
+    OPTIONAL { ?item wdt:P272 ?company. }
+    OPTIONAL { ?item wdt:P495 ?country. }
+    OPTIONAL { ?item wdt:P364 ?language. OPTIONAL { ?language wdt:P218 ?iso. } }
+    SERVICE wikibase:label { bd:serviceParam wikibase:language "ko,en". }
+  } LIMIT 50`;
+
+  const url = 'https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(query);
+  const response = await fetchWithTimeout(url, {
+    credentials: 'omit',
+    headers: { Accept: 'application/sparql-results+json' }
+  }, 8000);
+  if (!response.ok) throw new Error(`Wikidata HTTP ${response.status}`);
+
+  const json = await response.json();
+  const bindings = (json.results && json.results.bindings) || [];
+  const enrichment = { companies: [], countries: [], languages: [], languageCode: '' };
+
+  const pushUnique = (list, value) => {
+    if (value && !list.includes(value)) list.push(value);
+  };
+
+  bindings.forEach(row => {
+    pushUnique(enrichment.companies, row.companyLabel && row.companyLabel.value);
+    pushUnique(enrichment.countries, row.countryLabel && row.countryLabel.value);
+    pushUnique(enrichment.languages, row.languageLabel && row.languageLabel.value);
+    if (!enrichment.languageCode && row.iso && row.iso.value) {
+      enrichment.languageCode = row.iso.value;
+    }
+  });
+
+  cache[cacheKey] = { ts: Date.now(), data: enrichment };
+  return enrichment;
+}
+
+function mergeWikidata(data, enrichment) {
+  if (!enrichment) return;
+
+  if (data.productionCompanies.length === 0) {
+    enrichment.companies.forEach(name => data.productionCompanies.push({ name: name }));
+  }
+  if (data.productionCountries.length === 0) {
+    enrichment.countries.forEach(name => data.productionCountries.push({ name: name }));
+  }
+  if (data.spokenLanguages.length === 0) {
+    enrichment.languages.forEach(name => data.spokenLanguages.push({ name: name }));
+  }
+  if (!data.originalLanguageCode && enrichment.languageCode) {
+    data.originalLanguageCode = enrichment.languageCode;
+  }
+}
+
+async function enrichMediaData(data, options) {
+  const page = getPageInfo();
+  if (!page || !page.id) return;
+
+  const basePath = `/${page.kind}/${page.id}`;
+  const tasks = [];
+
+  if (options.galleries) {
+    tasks.push((async () => {
+      for (const kind of ['posters', 'backdrops']) {
+        try {
+          const urls = await fetchGalleryUrls(kind, basePath);
+          if (urls.length > 0) mergeGalleryImages(data, kind, urls);
+        } catch (error) {
+          console.warn(`TMDB ${kind} 보강 실패:`, error);
+        }
+      }
+    })());
+  }
+
+  if (options.cast) {
+    tasks.push((async () => {
+      try {
+        const fetched = await fetchCastAndCrew(basePath);
+        mergeCastAndCrew(data, fetched);
+      } catch (error) {
+        console.warn('TMDB 출연진/제작진 보강 실패:', error);
+      }
+    })());
+  }
+
+  if (options.videos) {
+    tasks.push((async () => {
+      try {
+        data.videos = await fetchAllVideos(basePath, data.videos);
+      } catch (error) {
+        console.warn('TMDB 영상 보강 실패:', error);
+      }
+    })());
+  }
+
+  if (options.releases) {
+    tasks.push((async () => {
+      try {
+        const releases = await fetchReleases(basePath);
+        if (releases.length > 0) data.releases = releases;
+      } catch (error) {
+        console.warn('TMDB 방송일 보강 실패:', error);
+      }
+    })());
+  }
+
+  if (options.wikidata) {
+    tasks.push((async () => {
+      try {
+        mergeWikidata(data, await fetchWikidataEnrichment(page));
+      } catch (error) {
+        console.warn('Wikidata 보강 실패:', error);
+      }
+    })());
+  }
+
+  await Promise.all(tasks);
 }
 
 // ===== 토스트 메시지 표시 함수 =====
@@ -391,7 +826,7 @@ function extractPersonData() {
       acting: [],
       production: []
     },
-    schemaVersion: '1.4',
+    schemaVersion: '1.5',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -586,7 +1021,7 @@ function extractPersonData() {
 }
 
 // ===== 미디어(영화/TV) 데이터 추출 함수 (통합) =====
-function extractMediaData() {
+async function extractMediaData(options = {}) {
   const pageInfo = getPageInfo();
   const isTV = pageInfo.kind === 'tv';
   
@@ -623,6 +1058,7 @@ function extractMediaData() {
     networks: [],
     type: '',
     originalLanguage: '',
+    originalLanguageCode: '',
     keywords: [],
     budget: '',
     revenue: '',
@@ -635,8 +1071,9 @@ function extractMediaData() {
     certification: '',
     releaseInfo: '',
     runtimeInfo: '',
+    releases: [],
     statusKey: '',
-    schemaVersion: '1.4',
+    schemaVersion: '1.5',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -732,6 +1169,10 @@ function extractMediaData() {
           }
         });
       }
+
+      if (ldData.inLanguage) {
+        data.originalLanguageCode = String(ldData.inLanguage);
+      }
       
       if (ldData.duration) {
         const duration = ldData.duration;
@@ -825,23 +1266,10 @@ function extractMediaData() {
             role.split(',').map(r => r.trim()).filter(Boolean).forEach(singleRole => {
               if (data.credits.crew.some(c => c.name === name && c.job === singleRole)) return;
 
-              let department = '';
-              const roleLower = singleRole.toLowerCase();
-              if (roleLower.includes('director')) department = 'Directing';
-              else if (roleLower.includes('creator')) department = 'Creator';
-              else if (roleLower.includes('writer') || roleLower.includes('screenplay') || roleLower.includes('story')) department = 'Writing';
-              else if (roleLower.includes('producer')) department = 'Production';
-              else if (roleLower.includes('cinematographer') || roleLower.includes('director of photography')) department = 'Camera';
-              else if (roleLower.includes('editor')) department = 'Editing';
-              else if (roleLower.includes('music') || roleLower.includes('composer')) department = 'Sound';
-              else if (roleLower.includes('art director') || roleLower.includes('production design')) department = 'Art';
-              else if (roleLower.includes('costume') || roleLower.includes('makeup') || roleLower.includes('hair')) department = 'Costume & Make-Up';
-              else if (roleLower.includes('visual effects') || roleLower.includes('vfx')) department = 'Visual Effects';
-
               data.credits.crew.push({
                 name: name,
                 job: singleRole,
-                department: department || 'Other'
+                department: getCrewDepartment(singleRole)
               });
             });
           }
@@ -1346,6 +1774,14 @@ function extractMediaData() {
       const keyword = el.textContent.trim();
       if (keyword && !data.keywords.includes(keyword)) data.keywords.push(keyword);
     });
+
+    // ===== 9. 하위 페이지/외부 소스 보강 =====
+    await enrichMediaData(data, options);
+
+    if (!data.certification) {
+      const krRelease = data.releases.find(release => release.countryCode === 'KR' && release.certification);
+      if (krRelease) data.certification = krRelease.certification;
+    }
 
     // 숫자 필드 타입 정규화 (LD+JSON 숫자 / DOM 문자열 혼재 제거)
     data.voteAverage = toNumber(data.voteAverage);

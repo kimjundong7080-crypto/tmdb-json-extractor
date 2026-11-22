@@ -8,8 +8,8 @@ Chrome Manifest V3 extension that extracts movie/TV/person data from The Movie D
 (TMDB) detail pages and copies/downloads it as JSON.
 
 - Working directory: `D:\크롬_앱\01-tmdb-json-extractor`
-- Extension version: `1.4` (see `manifest.json`)
-- Output schema version: `1.4` (`schemaVersion` field in media/person JSON)
+- Extension version: `1.5` (see `manifest.json`)
+- Output schema version: `1.5` (`schemaVersion` field in media/person JSON)
 
 ## Files
 
@@ -38,7 +38,27 @@ No build system, linter, or test runner. Plain JS loaded directly by Chrome.
   not retried, to avoid double listeners.
 - `handleExtraction` builds the payload, copies to clipboard (`copyToClipboard`, with
   `execCommand` fallback), then downloads a file. A single toast reports the combined result.
-- `downloadJsonFile` returns the final filename, or `null` on failure.
+- `downloadJsonFile` returns the final filename, or `null` on failure. It keeps using
+  `<a download>`, so files go to Chrome's default download folder.
+- `extractMediaData(options)` is async. The main-page DOM/LD+JSON extraction stays synchronous;
+  after it completes, `enrichMediaData()` optionally augments the payload.
+- **No TMDB API is used** (access was not approved). Enrichment uses same-origin TMDB HTML
+  subpages plus Wikidata SPARQL:
+  - `/{movie|tv}/{id}/images/posters`: variants default, `?image_language=xx`,
+    `?image_language=en` (120 ms apart).
+  - `/{movie|tv}/{id}/images/backdrops`: variants default, `?image_language=en`.
+  - `/{movie|tv}/{id}/cast`: full cast (`h3` "출연진"/"Cast" + following `ol.people`) and full
+    crew (`ol.people.crew` lists, department taken from the preceding `h4`).
+  - `/{movie|tv}/{id}/videos`: all video cards (`a[data-id]`).
+  - `/{movie|tv}/{id}/releases`: `table.releases` rows (country, date, certification, type).
+  - `https://query.wikidata.org/sparql`: fills missing companies/languages/countries and
+    `originalLanguageCode` via TMDB ID properties (movie `P4947`, TV `P4983`).
+- Subpage HTML is cached in `window.__tmdbFetchCache` for 10 minutes; Wikidata results in
+  `window.__tmdbWikidataCache` for 30 minutes. All fetches use an 8 s AbortController timeout,
+  and enrichment failures are logged without failing the extraction.
+- Gallery images are normalized to `media.themoviedb.org` and emitted as three variants
+  (`posters` w500, `posters_high` w780, `posters_original`; `backdrops` w780/w1280/original),
+  deduped by filename.
 
 ## Changes made in this session
 
@@ -73,6 +93,34 @@ No build system, linter, or test runner. Plain JS loaded directly by Chrome.
 15. **Manifest**: removed `activeTab`, narrowed host/matches/documentUrlPatterns to
     `*://www.themoviedb.org/*`.
 
+## Changes in 1.5 — no-API enrichment (2026-11-22)
+
+TMDB API approval was denied, so scraping was upgraded instead of replaced.
+
+1. **Subpage fetching**: `fetchHtmlDoc` + `DOMParser` read same-origin TMDB HTML with a 10 min
+   cache, 8 s timeout, and graceful failure per section.
+2. **Galleries**: poster/backdrop gallery pages are parsed for `a[href*="/t/p/"]`. Image URLs
+   from `image.tmdb.org` are normalized to `media.themoviedb.org`. Output is split into
+   display/high/original arrays and deduped by filename.
+3. **Full cast/crew**: `/cast` yields 69 cast and ~250 crew for the sample movie. Crew roles are
+   split on commas; departments come from the localized `h4` heading
+   (`normalizeDepartmentLabel`) with job-text inference as fallback.
+4. **All videos**: `/videos` adds cards missing from the detail page.
+5. **Releases**: `/releases` populates a new `releases[]` array
+   (`country`, `countryCode`, `date`, `certification`, `type`, `language`, `note`) and backfills
+   `certification` from the `KR` row when empty.
+6. **Wikidata enrichment**: SPARQL fills `productionCompanies`, `productionCountries`,
+   `spokenLanguages`, and `originalLanguageCode` only when those are empty. Verified CORS works
+   from the TMDB page origin.
+7. **Schema 1.5**: added `originalLanguageCode` and `releases`; media extraction is now async and
+   `handleExtraction` awaits it. Cast-only extraction fetches only `/cast`.
+8. **Manifest**: version 1.5; added `https://query.wikidata.org/*` to `host_permissions`.
+
+Live test on `movie/1368337` (full enrichment): ~2.4 s, 69 cast, 252 crew entries, 3 videos,
+170 poster URLs, 288 backdrop URLs, 110 releases, 2 companies, 3 countries, 1 language,
+`originalLanguageCode: "en"`. `voteAverage`/`voteCount` normalized to numbers (8 / 5302).
+Image arrays are deduped by filename with zero duplicate filenames after the final merge.
+
 ## Live verification (2026-11-21)
 
 Tested against `https://www.themoviedb.org/movie/1368337-the-odyssey`:
@@ -92,13 +140,21 @@ Tested against `https://www.themoviedb.org/movie/1368337-the-odyssey`:
 
 ## Known limitations
 
-- `productionCompanies` and `spokenLanguages` are empty on current TMDB movie pages because the
-  data is not present in DOM or LD+JSON. Only API enrichment could fill them.
-- `originalLanguage` is a localized label ("영어"); no reliable ISO code source on the page.
-- `certification` is whatever the page shows and may not match the release locale.
-- `releaseDate` prefers LD+JSON `datePublished`; it can differ from `releaseInfo` (local release).
-- Image collection covers only images rendered in the DOM. `posterCount`/`backdropCount` come
-  from menu labels and can greatly exceed the number of collected URLs.
+- `productionCompanies`, `productionCountries`, `spokenLanguages`, and `originalLanguageCode`
+  still depend on Wikidata. If the title has no Wikidata item or missing statements, they stay
+  empty. TMDB's own movie pages do not expose these fields in DOM or LD+JSON.
+- `originalLanguage` is a localized label ("영어"); `originalLanguageCode` comes from Wikidata
+  (`P218`) only, not from the page.
+- `certification` prefers the page value; `releases[].certification` is parsed from `/releases`
+  and may be empty per country. The first page certification can still be misleading.
+- `releaseDate` prefers LD+JSON `datePublished`; `releaseInfo` and `releases[]` can differ
+  (local release dates).
+- Galleries are language-filtered by TMDB. The extractor fetches default, `xx`, and `en`
+  (posters) or default and `en` (backdrops) to limit requests. `posterCount`/`backdropCount`
+  (menu labels, e.g. 489/332) can exceed the collected URLs (e.g. 170/288). Fetching every
+  language would need ~40 requests per gallery type and is intentionally not done by default.
+- Cast/crew/videos/releases pages can change markup; each fetch fails independently and is
+  logged, so one broken section does not abort extraction.
 - `w185`/`w780` are shared by multiple image types; path hints are preferred when available.
 - Date parsing in `releaseInfo` is locale-dependent; LD+JSON date is preferred.
 - The ZIP package is stale (1.3). Load the directory as an unpacked extension instead.
@@ -113,18 +169,31 @@ Get-Content -Raw manifest.json | ConvertFrom-Json
 
 All three passed after the last edits.
 
+Live integration test was also run by evaluating `content.js` in the TMDB page context
+(`extractMediaData` with all enrichment options enabled). Timings are ~2.4 s for 8 network
+requests (5 gallery pages, 1 cast page, 1 videos page, 1 releases page, 1 Wikidata query, with
+overlap), and all section failures are non-fatal.
+
 ## How to test manually
 
 1. Load `D:\크롬_앱\01-tmdb-json-extractor` via `chrome://extensions` (Developer mode, Load unpacked).
+   Reload the extension after code changes; version is 1.5.
 2. Open a movie page, e.g. `https://www.themoviedb.org/movie/1368337-the-odyssey`.
 3. Right-click -> "영화 JSON 추출" / "배우 JSON 추출"; check toast, clipboard, downloaded JSON.
-4. Verify numbering types and new fields: `schemaVersion`, `statusKey`, `sourceUrl`, `extractedAt`.
-5. Repeat on a TV detail page and a person page. Confirm season/episode subpages are rejected.
+4. Verify schema 1.5 fields: `schemaVersion`, `statusKey`, `sourceUrl`, `extractedAt`,
+   `originalLanguageCode`, `releases`, numeric `voteAverage`/`voteCount`.
+5. Verify enrichment on the sample movie: ~69 cast, ~252 crew, 3 videos, ~170 posters,
+   ~288 backdrops, 110 releases, 2 companies, 3 countries, 1 language.
+6. Repeat on a TV detail page and a person page. Confirm season/episode subpages are rejected.
+7. Confirm extraction still works when one subpage request fails (e.g. offline Wikidata); the
+   main payload must still be produced and a warning logged in the console.
 
 ## Possible next steps
 
-- Re-extract a sample after reloading the extension and compare against schema 1.4.
+- Re-extract a sample after reloading the extension and compare against schema 1.5.
 - Consider adding a `mediaType` field to media JSON.
-- Optionally enrich companies/languages via the TMDB API (requires an API key and new permissions;
-  out of current scope).
-- Rebuild the ZIP only if a packaged release is requested.
+- Optionally add a capped "all languages" gallery mode, or make the gallery language list
+  configurable (default is default/xx/en).
+- TMDB API access was denied; do not assume an API key. Wikidata is the only external source in
+  use, and it is best-effort only.
+- Rebuild the ZIP only if a packaged release is requested (current ZIP is stale 1.3).
