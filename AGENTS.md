@@ -1,6 +1,6 @@
 # TMDB JSON Extractor — Agent Handoff Notes
 
-Last updated: 2026-11-21
+Last updated: 2026-11-22
 
 ## Project overview
 
@@ -8,20 +8,34 @@ Chrome Manifest V3 extension that extracts movie/TV/person data from The Movie D
 (TMDB) detail pages and copies/downloads it as JSON.
 
 - Working directory: `D:\크롬_앱\01-tmdb-json-extractor`
+- Repository: `https://github.com/kimjundong7080-crypto/tmdb-json-extractor` (branch `main`)
 - Extension version: `1.5` (see `manifest.json`)
 - Output schema version: `1.5` (`schemaVersion` field in media/person JSON)
+- No TMDB API key is available (approval denied). Do not add API-dependent code paths.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `manifest.json` | MV3 manifest. Permissions: `contextMenus`, `clipboardWrite`, `scripting`. Host: `*://www.themoviedb.org/*`. |
+| `manifest.json` | MV3 manifest. Permissions: `contextMenus`, `clipboardWrite`, `scripting`. Hosts: `*://www.themoviedb.org/*`, `https://query.wikidata.org/*`. |
 | `background.js` | Context-menu registration (install/update safe), menu-id to action map, content-script dynamic injection fallback. |
 | `content.js` | All extraction logic: media/cast/person, toast UI, clipboard, JSON download, image helpers. |
 | `tmdb-json-extractor.zip` | Legacy 1.3 package. Intentionally NOT regenerated. Ignored by Git. |
 | `AGENTS.md` | This handoff/test log. |
 
 No build system, linter, or test runner. Plain JS loaded directly by Chrome.
+
+## Quick status (2026-11-22)
+
+- Extension/schema are both `1.5`; source directory is the deliverable (not the stale ZIP).
+- Media extraction is async and enriched from TMDB subpages plus Wikidata; all enrichment
+  failures are non-fatal.
+- Live test on `movie/1368337`: 69 cast, 252 crew, 3 videos, 170 posters, 288 backdrops,
+  110 releases, 2 companies, 3 countries, `originalLanguageCode: "en"`, ~2.4 s.
+- Gallery image dedupe bug is fixed: `mergeGalleryImages` now assigns the deduped arrays back
+  to `data.images.*`; verified zero duplicate filenames.
+- Open/manual item: reload the unpacked extension and smoke-test a TV detail page and a person
+  page. All-language galleries and TMDB API enrichment are intentionally out of scope.
 
 ## Architecture notes
 
