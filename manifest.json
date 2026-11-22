@@ -1,16 +1,20 @@
 {
   "manifest_version": 3,
   "name": "TMDB JSON Extractor Pro",
-  "version": "1.5",
-  "description": "TMDB 페이지에서 정보를 JSON으로 추출하고 복사합니다.",
+  "version": "1.7",
+  "description": "TMDB 페이지에서 정보를 JSON으로 추출하고, 사이트맵 기반으로 사이트를 반자동 크롤링해 다운로드합니다.",
   "permissions": [
     "contextMenus",
     "clipboardWrite",
-    "scripting"
+    "scripting",
+    "downloads",
+    "storage",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "*://www.themoviedb.org/*",
-    "https://query.wikidata.org/*"
+    "https://query.wikidata.org/*",
+    "https://files.tmdb.org/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -21,8 +25,10 @@
         "*://www.themoviedb.org/*"
       ],
       "js": [
-        "content.js"
-      ]
+        "content.js",
+        "crawler.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }

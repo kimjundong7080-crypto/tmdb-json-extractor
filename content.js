@@ -36,6 +36,21 @@ function getPageInfo() {
   return { kind: kind, id: match[2], isSubPage: isSubPage };
 }
 
+// ===== 크롤러 설정 (crawler.js가 저장) =====
+// content.js는 background에서 재주입될 수 있으므로 top-level const/let을 두지 않는다.
+async function getCrawlerSettings() {
+  const defaults = { allLanguages: false, subpageMinMs: 700, subpageMaxMs: 1800 };
+  try {
+    const result = await chrome.storage.local.get('tmdbCrawlerSettings');
+    const saved = (result && result.tmdbCrawlerSettings) || {};
+    // 설정 구조가 바뀐 예전 저장값(예: allLanguages:true)은 무시한다
+    if (saved && saved._v === 3) return Object.assign({}, defaults, saved);
+    return defaults;
+  } catch (e) {
+    return defaults;
+  }
+}
+
 // ===== 공통 추출 처리 =====
 async function handleExtraction(kind, sendResponse) {
   const respond = typeof sendResponse === 'function' ? sendResponse : function () {};
@@ -73,10 +88,18 @@ async function handleExtraction(kind, sendResponse) {
       prefix = 'person';
       successMessage = `✅ 배우 "${data.name}" 정보가 클립보드에 복사되었습니다!`;
     } else {
+      const crawlSettings = await getCrawlerSettings();
       const data = await extractMediaData(
         kind === 'cast'
           ? { cast: true }
-          : { galleries: true, cast: true, videos: true, releases: true, wikidata: true }
+          : {
+              galleries: true,
+              cast: true,
+              videos: true,
+              releases: true,
+              wikidata: true,
+              allLanguages: crawlSettings.allLanguages === true
+            }
       );
 
       if (kind === 'cast') {
@@ -169,13 +192,37 @@ async function copyToClipboard(text) {
   }
 }
 
+// ===== 파일명 규칙: movie-1368337-the-odyssey.json =====
+function safeFilePart(value) {
+  return String(value || '')
+    .replace(/[^a-zA-Z0-9\-_]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '')
+    .slice(0, 100);
+}
+
+function slugFromPath(pathname, kind, id) {
+  try {
+    const match = String(pathname || '').match(new RegExp('^/' + kind + '/' + String(id) + '([^/?#]*)'));
+    return match ? match[1].replace(/^[-/]+/, '') : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 크롤러와 같은 파일명 규칙: movie-1368337-the-odyssey.json
+function buildOutputFilename(kind, id, title) {
+  const slug = safeFilePart(slugFromPath(window.location.pathname, kind, id) || title);
+  return [kind, String(id), slug].filter(Boolean).join('-') + '.json';
+}
+
 // ===== JSON 파일 자동 다운로드 함수 =====
 function downloadJsonFile(jsonString, filename, prefix, id) {
   try {
-    const safeFilename = String(filename || prefix || 'export')
-      .replace(/[^a-zA-Z0-9가-힣]/g, '_')
-      .substring(0, 50);
-    const finalFilename = `${prefix || 'export'}_${id || Date.now()}_${safeFilename}.json`;
+    const info = getPageInfo();
+    const kind = prefix || info.kind || 'export';
+    const pageId = String(info.id || id || Date.now());
+    const finalFilename = buildOutputFilename(kind, pageId, filename);
 
     const blob = new Blob([jsonString], { type: 'application/json' });
     const downloadUrl = URL.createObjectURL(blob);
@@ -334,6 +381,44 @@ function getImageFilename(url) {
   return normalizeImageUrl(url).split('/').pop();
 }
 
+// ===== 유튜브 링크 수집 =====
+// 본문/소개글/앵커에 포함된 유튜브 주소와 영상 목록을 videoId 기준으로 모은다.
+function collectYoutubeLinks(texts, urls) {
+  // watch / embed / shorts / live / youtu.be 를 모두 videoId로 정규화한다
+  const idPattern = /(?:youtube\.com\/(?:watch\?[^#\s"'<>]*?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{6,20})/;
+  const seen = {};
+  const rows = [];
+
+  function add(url, title, source) {
+    const match = String(url || '').match(idPattern);
+    if (!match || seen[match[1]]) return;
+    seen[match[1]] = true;
+    rows.push({
+      videoId: match[1],
+      url: 'https://www.youtube.com/watch?v=' + match[1],
+      title: String(title || '').trim().slice(0, 200),
+      source
+    });
+  }
+
+  try {
+    document.querySelectorAll('a[href*="youtube.com"], a[href*="youtu.be"]').forEach(anchor => {
+      add(anchor.getAttribute('href'), anchor.textContent, 'link');
+    });
+  } catch (e) {}
+
+  (Array.isArray(texts) ? texts : []).forEach(text => {
+    const re = new RegExp(idPattern.source, 'g');
+    let match;
+    while ((match = re.exec(String(text || '')))) {
+      add('https://www.youtube.com/watch?v=' + match[1], '', 'text');
+    }
+  });
+
+  (Array.isArray(urls) ? urls : []).forEach(url => add(url, '', 'video'));
+  return rows;
+}
+
 function buildImageVariants(originalUrl, displayToken, highToken) {
   return {
     display: replaceImageSize(originalUrl, displayToken),
@@ -346,9 +431,74 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ===== 사람처럼 요청하기: 전역 직렬 큐 + 지터 + 429 백오프 =====
+// 갤러리/출연진/영상/개봉정보 보강이 동시에 요청을 쏘지 않도록 모든 TMDB 요청을 한 줄로 세운다.
+// 재주입 안전성을 위해 상태는 window에 둔다(top-level const/let 재선언 방지).
+function getTmdbPacing() {
+  if (!window.__tmdbPacing) {
+    window.__tmdbPacing = {
+      minMs: 700,
+      maxMs: 1800,
+      cooldownMs: 5 * 60 * 1000,
+      chain: Promise.resolve(),
+      lastAt: 0,
+      rateLimitUntil: 0,
+      streak: 0
+    };
+  }
+  return window.__tmdbPacing;
+}
+
+function setPacing(options) {
+  if (!options || typeof options !== 'object') return;
+  const pacing = getTmdbPacing();
+  const min = Number(options.minMs);
+  const max = Number(options.maxMs);
+  if (isFinite(min) && min >= 100) pacing.minMs = min;
+  if (isFinite(max) && max >= pacing.minMs) pacing.maxMs = max;
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// robots.txt의 Disallow 경로(/person/*/remote/credits, image_sort=)는 요청하지 않는다
+function isDisallowedPath(path) {
+  const value = String(path || '');
+  if (/\/person\/\d+\/remote\/credits/.test(value)) return true;
+  return /image_sort=/.test(value);
+}
+
+async function waitForRequestSlot() {
+  const pacing = getTmdbPacing();
+  const now = Date.now();
+  if (pacing.rateLimitUntil > now) {
+    throw new Error('429 한도 대기 중 (' + Math.ceil((pacing.rateLimitUntil - now) / 1000) + 's)');
+  }
+  const nextAt = Math.max(now, pacing.lastAt + randomBetween(pacing.minMs, pacing.maxMs));
+  if (nextAt > now) await delay(nextAt - now);
+  pacing.lastAt = Date.now();
+}
+
+function serializeTmdbRequest(task) {
+  const pacing = getTmdbPacing();
+  const run = pacing.chain.then(task, task);
+  pacing.chain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 function getFetchCache() {
   if (!window.__tmdbFetchCache) window.__tmdbFetchCache = {};
   return window.__tmdbFetchCache;
+}
+
+// 상대 경로가 엉뚱한 origin으로 풀리는 경우를 막기 위해 항상 origin 기준 절대 URL로 만든다
+function absoluteUrl(path) {
+  try {
+    return new URL(path, window.location.origin).href;
+  } catch (e) {
+    return path;
+  }
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -361,44 +511,174 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-async function fetchHtmlDoc(path, timeoutMs) {
+// 페이지 표시 언어: URL의 ?language= 값을 우선하고, 없으면 <html lang>을 쓴다.
+// 이 값을 하위 페이지(/cast, /videos, 갤러리) 요청에도 붙여 페이지와 언어를 맞춘다.
+function pageLocale() {
+  const known = { ko: 'ko-KR', en: 'en-US', ja: 'ja-JP', de: 'de-DE', zh: 'zh-TW', fr: 'fr-FR', es: 'es-ES', pt: 'pt-BR', ru: 'ru-RU', it: 'it-IT', hi: 'hi-IN' };
+  let code = '';
+  try {
+    code = new URL(window.location.href).searchParams.get('language') || '';
+  } catch (e) {}
+  if (!code) {
+    try {
+      code = (document.documentElement && document.documentElement.getAttribute('lang')) || '';
+    } catch (e) {}
+  }
+  code = String(code || '').trim();
+  if (!/^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$/.test(code)) return '';
+  if (code.indexOf('-') === -1) return known[code.toLowerCase()] || code;
+  return code;
+}
+
+function withPageLocale(path) {
+  const locale = pageLocale();
+  const value = String(path || '');
+  if (!locale || value.charAt(0) !== '/') return value;
+  try {
+    const url = new URL(value, window.location.origin);
+    if (url.searchParams.has('language')) return value;
+    url.searchParams.set('language', locale);
+    return url.pathname + url.search;
+  } catch (e) {
+    return value;
+  }
+}
+
+async function fetchHtmlDoc(path, timeoutMs, options) {
+  const target = withPageLocale(path);
   const cache = getFetchCache();
-  const cached = cache[path];
+  const cached = cache[target];
   if (cached && (Date.now() - cached.ts) < 10 * 60 * 1000) {
     return new DOMParser().parseFromString(cached.html, 'text/html');
   }
+  if (isDisallowedPath(target)) {
+    throw new Error(`robots.txt에서 제외된 경로입니다 (${target})`);
+  }
 
-  const response = await fetchWithTimeout(path, {}, timeoutMs);
-  if (!response.ok) throw new Error(`HTTP ${response.status} (${path})`);
-  const html = await response.text();
-  cache[path] = { ts: Date.now(), html: html };
-  return new DOMParser().parseFromString(html, 'text/html');
+  return serializeTmdbRequest(async () => {
+    // 429는 Retry-After를 존중하고 5s → 15s → 45s로 물러선다
+    const backoff = [0, 5000, 15000, 45000];
+    let lastStatus = 0;
+
+    for (let attempt = 0; attempt < backoff.length; attempt++) {
+      if (backoff[attempt] > 0) await delay(backoff[attempt] + randomBetween(0, 1500));
+      await waitForRequestSlot();
+
+      const response = await fetchWithTimeout(absoluteUrl(target), {}, timeoutMs);
+      lastStatus = response.status;
+
+      if (response.status === 429) {
+        const pacing = getTmdbPacing();
+        pacing.streak += 1;
+        const retryAfter = Number(response.headers.get('retry-after'));
+        if (isFinite(retryAfter) && retryAfter > 0 && retryAfter < 120) await delay(retryAfter * 1000);
+        if (pacing.streak >= 3) {
+          pacing.rateLimitUntil = Date.now() + pacing.cooldownMs;
+          throw new Error(`429 요청 한도: 5분 뒤 재시도합니다 (${target})`);
+        }
+        continue;
+      }
+      if (response.status >= 500) continue;
+      if (!response.ok) throw new Error(`HTTP ${response.status} (${target})`);
+
+      getTmdbPacing().streak = 0;
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType && contentType.indexOf('text/html') === -1) {
+        throw new Error(`HTML이 아님 (${contentType}) ${target}`);
+      }
+      const html = await response.text();
+
+      // 갤러리 전 언어 수집처럼 많은 페이지를 훑을 때는 HTML 캐시를 남기지 않는다
+      const shouldCache = !options || options.cache !== false;
+      if (shouldCache) {
+        const keys = Object.keys(cache);
+        if (keys.length > 40) {
+          keys.sort((a, b) => (cache[a].ts || 0) - (cache[b].ts || 0))
+            .slice(0, keys.length - 40)
+            .forEach(key => delete cache[key]);
+        }
+        cache[target] = { ts: Date.now(), html: html };
+      }
+      return new DOMParser().parseFromString(html, 'text/html');
+    }
+
+    throw new Error(`HTTP ${lastStatus || 'error'} (${target})`);
+  });
 }
 
-async function fetchGalleryUrls(kind, basePath) {
-  const variants = kind === 'posters'
-    ? ['', '?image_language=xx', '?image_language=en']
-    : ['', '?image_language=en'];
+async function getGalleryLanguages(kind, basePath) {
+  const doc = await fetchHtmlDoc(`${basePath}/images/${kind}`);
+  const codes = [];
+  doc.querySelectorAll('a[href*="image_language"]').forEach(anchor => {
+    const match = (anchor.getAttribute('href') || '').match(/image_language=([a-zA-Z-]+)/);
+    const code = match ? match[1] : '';
+    if (code && code !== 'xx' && !codes.includes(code)) codes.push(code);
+  });
+  return codes;
+}
+
+// 갤러리 언어 필터를 모두 순회해 이미지 URL을 모은다.
+// allLanguages=true 이면 TMDB가 제공하는 언어 전부(+xx), false(기본값) 이면 사이트 언어 1종만 본다.
+async function fetchGalleryUrls(kind, basePath, options) {
+  const allLanguages = !!(options && options.allLanguages === true);
+  const locale = pageLocale();
+  if (!window.__tmdbGalleryCache) window.__tmdbGalleryCache = {};
+  const cacheKey = `${basePath}/images/${kind}|${allLanguages ? 'all' : locale || 'basic'}`;
+  const cached = window.__tmdbGalleryCache[cacheKey];
+  if (cached && (Date.now() - cached.ts) < 10 * 60 * 1000) {
+    return cached.urls.slice();
+  }
+
+  const variants = [''];
+  if (allLanguages) {
+    try {
+      const codes = await getGalleryLanguages(kind, basePath);
+      codes.forEach(code => variants.push('?image_language=' + encodeURIComponent(code)));
+    } catch (error) {
+      console.warn(`TMDB ${kind} 언어 목록 수집 실패:`, error);
+    }
+    if (!variants.includes('?image_language=xx')) variants.push('?image_language=xx');
+  } else {
+    // 선택한 언어의 갤러리 1종만 수집한다(요청 1회)
+    const short = String(locale || '').split('-')[0].toLowerCase();
+    if (short) {
+      variants.length = 0;
+      variants.push('?image_language=' + encodeURIComponent(short));
+    }
+  }
+  const uniqueVariants = Array.from(new Set(variants));
 
   const seen = {};
   const urls = [];
+  let index = 0;
+  const CONCURRENCY = 1;  // 사람처럼 한 번에 한 요청만 보낸다(429 방지)
 
-  for (const variant of variants) {
-    try {
-      const doc = await fetchHtmlDoc(`${basePath}/images/${kind}${variant}`);
-      doc.querySelectorAll('.card a[href*="/t/p/"]').forEach(anchor => {
-        const href = normalizeImageUrl(anchor.getAttribute('href'));
-        const name = getImageFilename(href);
-        if (!href || !name || seen[name]) return;
-        seen[name] = true;
-        urls.push(href);
-      });
-    } catch (error) {
-      console.warn(`TMDB ${kind} 갤러리 수집 실패 (${variant || 'default'}):`, error);
+  async function worker() {
+    while (index < uniqueVariants.length) {
+      const variant = uniqueVariants[index++];
+      try {
+        const doc = await fetchHtmlDoc(`${basePath}/images/${kind}${variant}`, undefined, { cache: false });
+        let anchors = doc.querySelectorAll('.card a[href*="/t/p/"]');
+        if (anchors.length === 0) anchors = doc.querySelectorAll('a[href*="/t/p/"]');
+        anchors.forEach(anchor => {
+          const href = normalizeImageUrl(anchor.getAttribute('href'));
+          const name = getImageFilename(href);
+          if (!href || !name || seen[name]) return;
+          seen[name] = true;
+          urls.push(href);
+        });
+      } catch (error) {
+        console.warn(`TMDB ${kind} 갤러리 수집 실패 (${variant || 'default'}):`, error);
+      }
+      await delay(randomBetween(900, 2000));
     }
-    await delay(120);
   }
 
+  const workers = [];
+  for (let i = 0; i < Math.min(CONCURRENCY, uniqueVariants.length); i++) workers.push(worker());
+  await Promise.all(workers);
+
+  window.__tmdbGalleryCache[cacheKey] = { ts: Date.now(), urls: urls.slice() };
   return urls;
 }
 
@@ -479,10 +759,100 @@ function normalizeDepartmentLabel(label) {
 function findCastList(doc) {
   const headings = Array.from(doc.querySelectorAll('h2, h3'));
   const castHeading = headings.find(h => /출연진|^Cast\b/i.test(h.textContent.trim()));
-  if (castHeading && castHeading.nextElementSibling && castHeading.nextElementSibling.matches('ol.people')) {
-    return castHeading.nextElementSibling;
+  if (castHeading) {
+    const next = castHeading.nextElementSibling;
+    if (next && next.matches('ol.people, ul.people')) return next;
+    const scope = castHeading.parentElement;
+    const nested = scope ? scope.querySelector('ol.people, ul.people') : null;
+    if (nested) return nested;
   }
-  return doc.querySelector('ol.people.credits') || null;
+  return doc.querySelector('ol.people.credits, ul.people.credits') || null;
+}
+
+// 제작진 목록은 ol.people.crew가 기본이지만, 마크업에 따라 부서 h3/h4 뒤의
+// ol.people/ul.people로만 존재할 수 있다. 출연진 목록을 제작진으로 오인하지 않도록
+// 부서명이 들어간 헤딩과 연결된 목록만 채택한다.
+function findCrewLists(doc) {
+  const primary = Array.from(doc.querySelectorAll('ol.people.crew, ul.people.crew'));
+  if (primary.length > 0) return primary;
+
+  const crewHeading = /제작|연출|각본|제작진|음향|미술|카메라|의상|분장|편집|조명|시각|crew|direct|writing|production|sound|art|camera|costume|editing|lighting|visual/i;
+  const found = [];
+  Array.from(doc.querySelectorAll('h3, h4')).forEach(heading => {
+    if (!crewHeading.test(heading.textContent.trim())) return;
+    const scope = heading.parentElement || doc;
+    Array.from(scope.querySelectorAll('ol.people, ul.people')).forEach(list => {
+      if (found.indexOf(list) === -1) found.push(list);
+    });
+  });
+  return found;
+}
+
+function crewHeadingFor(list) {
+  let node = list.previousElementSibling;
+  while (node && !/^H[34]$/.test(node.tagName)) node = node.previousElementSibling;
+  if (node) return node.textContent.trim();
+
+  const parent = list.parentElement;
+  if (parent) {
+    const heading = parent.querySelector('h4, h3');
+    if (heading) return heading.textContent.trim();
+    const previous = parent.previousElementSibling;
+    const nested = previous && previous.querySelector ? previous.querySelector('h4, h3') : null;
+    if (nested) return nested.textContent.trim();
+  }
+  return '';
+}
+
+// /cast 문서에서 "인물 페이지 링크"만 뽑는다(감독 판별 포함).
+// 크롤러는 이 정보로 배우/감독 인물 큐를 채운다.
+async function fetchCreditLinks(basePath) {
+  const doc = await fetchHtmlDoc(basePath + '/cast');
+  const cast = [];
+  const directors = [];
+  const seen = {};
+
+  function personEntry(anchor) {
+    const href = (anchor && anchor.getAttribute('href')) || '';
+    const match = href.match(/^\/person\/(\d+)(?:-([^/?#]*))?/);
+    if (!match) return null;
+    return {
+      t: 'person',
+      id: match[1],
+      url: '/person/' + match[1] + (match[2] ? '-' + match[2] : '')
+    };
+  }
+
+  const castList = findCastList(doc);
+  if (castList) {
+    castList.querySelectorAll('li').forEach(li => {
+      const entry = personEntry(li.querySelector('.info p a[href^="/person/"], p a[href^="/person/"], a[href^="/person/"]'));
+      if (entry && !seen['c' + entry.id]) {
+        seen['c' + entry.id] = true;
+        cast.push(entry);
+      }
+    });
+  }
+
+  findCrewLists(doc).forEach(list => {
+    const heading = crewHeadingFor(list);
+    const department = normalizeDepartmentLabel(heading);
+    const headingIsDirecting = department === 'Directing' || /감독|연출|director/i.test(heading);
+
+    list.querySelectorAll('li').forEach(li => {
+      const jobEl = li.querySelector('p.episode_count_crew, p.character, .character');
+      const job = jobEl ? jobEl.textContent.trim() : '';
+      if (!headingIsDirecting && !/감독|director|연출/i.test(job)) return;
+
+      const entry = personEntry(li.querySelector('.info p a[href^="/person/"], p a[href^="/person/"], a[href^="/person/"]'));
+      if (entry && !seen['d' + entry.id]) {
+        seen['d' + entry.id] = true;
+        directors.push(entry);
+      }
+    });
+  });
+
+  return { cast: cast, directors: directors };
 }
 
 async function fetchCastAndCrew(basePath) {
@@ -512,14 +882,14 @@ async function fetchCastAndCrew(basePath) {
   }
 
   const crew = [];
-  doc.querySelectorAll('ol.people.crew').forEach(list => {
-    const heading = list.previousElementSibling;
-    const listedDepartment = normalizeDepartmentLabel(heading ? heading.textContent.trim() : '');
+  findCrewLists(doc).forEach(list => {
+    const heading = crewHeadingFor(list);
+    const listedDepartment = normalizeDepartmentLabel(heading);
 
     list.querySelectorAll('li').forEach(li => {
       const nameLink = li.querySelector('.info p a, p a');
       const name = nameLink ? nameLink.textContent.trim() : '';
-      if (!name || castNames[name]) return;
+      if (!name) return;  // 배우 겸 제작진도 수집한다(중복은 merge 단계에서 제거)
 
       const jobEl = li.querySelector('p.episode_count_crew, p.character, .character');
       const job = jobEl ? jobEl.textContent.trim() : '';
@@ -627,13 +997,13 @@ async function fetchWikidataEnrichment(page) {
   if (cached && (Date.now() - cached.ts) < 30 * 60 * 1000) return cached.data;
 
   const property = getTmdbWikidataProperty(page.kind);
+  // OPTIONAL을 이어 붙이면 카르테시안 곱이 되어 LIMIT에서 잘리므로 UNION으로 분리한다
   const query = `SELECT ?companyLabel ?countryLabel ?languageLabel ?iso WHERE {
     ?item wdt:${property} "${page.id}".
-    OPTIONAL { ?item wdt:P272 ?company. }
-    OPTIONAL { ?item wdt:P495 ?country. }
-    OPTIONAL { ?item wdt:P364 ?language. OPTIONAL { ?language wdt:P218 ?iso. } }
+    { ?item wdt:P272 ?company. } UNION { ?item wdt:P495 ?country. } UNION { ?item wdt:P364 ?language. }
+    OPTIONAL { ?language wdt:P218 ?iso. }
     SERVICE wikibase:label { bd:serviceParam wikibase:language "ko,en". }
-  } LIMIT 50`;
+  } LIMIT 500`;
 
   const url = 'https://query.wikidata.org/sparql?format=json&query=' + encodeURIComponent(query);
   const response = await fetchWithTimeout(url, {
@@ -691,7 +1061,7 @@ async function enrichMediaData(data, options) {
     tasks.push((async () => {
       for (const kind of ['posters', 'backdrops']) {
         try {
-          const urls = await fetchGalleryUrls(kind, basePath);
+          const urls = await fetchGalleryUrls(kind, basePath, options);
           if (urls.length > 0) mergeGalleryImages(data, kind, urls);
         } catch (error) {
           console.warn(`TMDB ${kind} 보강 실패:`, error);
@@ -721,7 +1091,7 @@ async function enrichMediaData(data, options) {
     })());
   }
 
-  if (options.releases) {
+  if (options.releases && page.kind === 'movie') {  // TV에는 /releases 페이지가 없다(404)
     tasks.push((async () => {
       try {
         const releases = await fetchReleases(basePath);
@@ -822,11 +1192,13 @@ function extractPersonData() {
     biography: '',
     contentScore: '',
     knownForWorks: [],
+    youtubeLinks: [],
     credits: {
       acting: [],
-      production: []
+      production: [],
+      all: []
     },
-    schemaVersion: '1.5',
+    schemaVersion: '1.7',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -893,14 +1265,14 @@ function extractPersonData() {
         const label = strong.textContent.trim();
         const value = el.textContent.replace(label, '').trim();
         
-        if (label.includes('Known For')) data.knownFor = value;
-        else if (label.includes('Known Credits')) data.knownCredits = value;
-        else if (label.includes('Gender')) data.gender = value;
-        else if (label.includes('Birthday')) {
+        if (label.includes('Known For') || label.includes('전문 분야')) data.knownFor = value;
+        else if (label.includes('Known Credits') || label.includes('참여 작품 수')) data.knownCredits = value;
+        else if (label.includes('Gender') || label.includes('성별')) data.gender = value;
+        else if (label.includes('Birthday') || label.includes('생일') || label.includes('출생일')) {
           data.birthday = value;
-          const ageMatch = value.match(/(\d+)\s*years? old/);
+          const ageMatch = value.match(/(\d+)\s*(?:years?\s*old|세)/);
           if (ageMatch) data.age = ageMatch[1] + ' years old';
-        } else if (label.includes('Place of Birth')) data.placeOfBirth = value;
+        } else if (label.includes('Place of Birth') || label.includes('출생지')) data.placeOfBirth = value;
       }
     });
 
@@ -951,27 +1323,88 @@ function extractPersonData() {
       });
     }
 
-    // Acting 크레딧
-    const actingSection = document.querySelector('h3.zero');
-    if (actingSection) {
-      const container = actingSection.parentElement;
-      const rows = container.querySelectorAll('.credit_group');
-      rows.forEach(row => {
-        const yearEl = row.querySelector('.year');
+    // 크레딧 전체(연기/제작/각본/제작진/편집/창작자 등) — h3.zero 같은 위치 클래스 대신
+    // 섹션 라벨(.credit_heading) 기준으로 모든 .credit_group 행을 수집한다.
+    // 부서 라벨은 .credit_heading(전체 필터 UI 1개)이 아니라 섹션 h3에 있다.
+    const departmentLabels = /^(연기|제작|제작진|각본|연출|편집|창작자|음향|미술|카메라|의상|분장|시각|조명|Acting|Production|Crew|Writing|Directing|Editing|Creator|Sound|Art|Camera|Costume|Visual|Lighting)/i;
+    const creditHeadings = Array.from(document.querySelectorAll('h3'))
+      .map(heading => ({
+        el: heading,
+        label: heading.textContent.replace(/\s+/g, ' ').replace(/\s*\d+\s*$/, '').trim()
+      }))
+      .filter(entry => departmentLabels.test(entry.label));
+
+    function getSectionLabel(table) {
+      let label = '';
+      creditHeadings.forEach(entry => {
+        if (entry.el.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) {
+          label = entry.label;
+        }
+      });
+      return label;
+    }
+
+    function departmentFromLabel(label) {
+      const text = String(label || '').toLowerCase();
+      if (!text) return '';
+      if (/연기|acting/.test(text)) return 'Acting';
+      if (/제작진|crew/.test(text)) return 'Crew';
+      if (/각본|writing|script/.test(text)) return 'Writing';
+      if (/연출|directing/.test(text)) return 'Directing';
+      if (/제작|production/.test(text)) return 'Production';
+      if (/편집|editing/.test(text)) return 'Editing';
+      if (/음향|sound/.test(text)) return 'Sound';
+      if (/미술|art/.test(text)) return 'Art';
+      if (/카메라|camera|photography/.test(text)) return 'Camera';
+      if (/의상|분장|costume/.test(text)) return 'Costume & Make-Up';
+      if (/시각|visual effects/.test(text)) return 'Visual Effects';
+      if (/조명|lighting/.test(text)) return 'Lighting';
+      if (/창작|creator/.test(text)) return 'Creator';
+      return label;
+    }
+
+    const seenCredits = {};
+
+    document.querySelectorAll('.credit_group').forEach(table => {
+      const sectionLabel = getSectionLabel(table);
+      const department = departmentFromLabel(sectionLabel);
+
+      table.querySelectorAll('tr').forEach(row => {
         const titleLink = row.querySelector('.role a');
+        if (!titleLink) return;
+
+        const title = titleLink.textContent.trim();
+        if (!title) return;
+
+        const titleUrl = titleLink.getAttribute('href') || '';
+        const idMatch = titleUrl.match(/\/(movie|tv)\/(\d+)/);
+        const yearEl = row.querySelector('.year');
         const characterEl = row.querySelector('.character');
+        const roleEl = row.querySelector('.role span.role, .role .role');
         const episodeEl = row.querySelector('.tv');
-        
-        const year = yearEl ? yearEl.textContent.trim() : '';
-        const title = titleLink ? titleLink.textContent.trim() : '';
-        const titleUrl = titleLink ? titleLink.getAttribute('href') || '' : '';
-        const character = characterEl ? characterEl.textContent.trim() : '';
-        const episodes = episodeEl ? episodeEl.textContent.trim() : '';
-        
-        const mediaType = titleUrl.includes('/movie/') ? 'movie' : 
-                         titleUrl.includes('/tv/') ? 'tv' : 'unknown';
-        
-        if (title && !data.credits.acting.find(c => c.title === title && c.year === year)) {
+
+        const year = yearEl ? yearEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        const character = characterEl ? characterEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        const role = roleEl ? roleEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        const episodes = episodeEl ? episodeEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        const mediaType = titleUrl.includes('/movie/') ? 'movie' : titleUrl.includes('/tv/') ? 'tv' : 'unknown';
+
+        const key = [department, title, year, role, character, idMatch ? idMatch[2] : ''].join('|');
+        if (seenCredits[key]) return;
+        seenCredits[key] = true;
+
+        data.credits.all.push({
+          department: department,
+          year: year || null,
+          title: title,
+          id: idMatch ? idMatch[2] : '',
+          mediaType: mediaType,
+          role: role || null,
+          character: character || null,
+          episodes: episodes || null
+        });
+
+        if (department === 'Acting' && !data.credits.acting.some(c => c.title === title && c.year === (year || null))) {
           data.credits.acting.push({
             year: year || null,
             title: title,
@@ -980,28 +1413,8 @@ function extractPersonData() {
             episodes: episodes || null
           });
         }
-      });
-    }
 
-    // Production 크레딧
-    const productionSection = document.querySelector('h3.one');
-    if (productionSection) {
-      const container = productionSection.parentElement;
-      const rows = container.querySelectorAll('.credit_group');
-      rows.forEach(row => {
-        const yearEl = row.querySelector('.year');
-        const titleLink = row.querySelector('.role a');
-        const roleEl = row.querySelector('.role span.role');
-        
-        const year = yearEl ? yearEl.textContent.trim() : '';
-        const title = titleLink ? titleLink.textContent.trim() : '';
-        const titleUrl = titleLink ? titleLink.getAttribute('href') || '' : '';
-        const role = roleEl ? roleEl.textContent.trim() : '';
-        
-        const mediaType = titleUrl.includes('/movie/') ? 'movie' : 
-                         titleUrl.includes('/tv/') ? 'tv' : 'unknown';
-        
-        if (title && !data.credits.production.find(c => c.title === title && c.year === year)) {
+        if (department === 'Production' && !data.credits.production.some(c => c.title === title && c.year === (year || null))) {
           data.credits.production.push({
             year: year || null,
             title: title,
@@ -1010,13 +1423,14 @@ function extractPersonData() {
           });
         }
       });
-    }
+    });
 
   } catch (error) {
     console.error('배우 데이터 추출 중 오류:', error);
     throw error;
   }
 
+  data.youtubeLinks = collectYoutubeLinks([data.biography]);
   return data;
 }
 
@@ -1046,6 +1460,7 @@ async function extractMediaData(options = {}) {
       crew: []
     },
     videos: [],
+    youtubeLinks: [],
     images: {
       posters: [],
       backdrops: [],
@@ -1073,7 +1488,7 @@ async function extractMediaData(options = {}) {
     runtimeInfo: '',
     releases: [],
     statusKey: '',
-    schemaVersion: '1.5',
+    schemaVersion: '1.7',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -1802,6 +2217,12 @@ async function extractMediaData(options = {}) {
     throw error;
   }
 
+  // 본문·소개글·앵커에 포함된 유튜브 링크 + 수집한 영상 URL
+  data.youtubeLinks = collectYoutubeLinks(
+    [data.overview, data.tagline, data.homepage],
+    (data.videos || []).map(video => video.url)
+  );
+
   return data;
 }
 
@@ -1839,3 +2260,15 @@ function isBackdropImage(url) {
     'w1066_and_h600', 'w1066_and_h600_face'
   ].indexOf(token) !== -1;
 }
+
+// ===== 크롤러(crawler.js)용 공개 API =====
+window.__tmdbExtractor = {
+  getPageInfo: getPageInfo,
+  extractMediaData: extractMediaData,
+  extractPersonData: extractPersonData,
+  fetchHtmlDoc: fetchHtmlDoc,
+  fetchCreditLinks: fetchCreditLinks,
+  getGalleryLanguages: getGalleryLanguages,
+  setPacing: setPacing,
+  showToast: showToast
+};

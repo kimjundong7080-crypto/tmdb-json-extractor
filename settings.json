@@ -1,0 +1,14 @@
+{
+  "_v": 3,
+  "language": "ko-KR",
+  "targets": { "movie": true, "tv": true, "cast": false, "director": false },
+  "sitemapKinds": { "movie": true, "tv": true, "person": false },
+  "newestFirst": false,
+  "autoFollow": true,
+  "autoFollowQueue": 5,
+  "autoFollowLimit": 8,
+  "peoplePerTitle": 30,
+  "saveImages": false,
+  "overwrite": true,
+  "autoLog": true
+}
