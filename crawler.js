@@ -80,7 +80,11 @@
     breakMinSec: 120,
     breakMaxSec: 300,
     maxListPages: 300,
-    folder: 'tmdb'
+    folder: 'tmdb',
+    // OMDb 보강용 API 키 (선택). chrome.storage에만 저장하고 settings.json에는 쓰지 않는다.
+    omdbApiKey: '',
+    // Wikidata 보조 데이터(회사·국가·언어·IMDb ID) 수집 여부
+    useWikidata: true
   };
 
   const state = {
@@ -179,6 +183,11 @@
     return line;
   }
 
+  // content.js의 보강 실패를 크롤러 로그에도 남긴다(데이터 누락 원인 추적용).
+  window.__tmdbEnrichWarn = function (message, detail) {
+    log('보강 실패', String(message || '') + (detail ? ' · ' + detail : ''));
+  };
+
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -215,6 +224,131 @@
         resolve();
       }
     });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 프로젝트 폴더 직접 저장 (File System Access API)                     */
+  /* Chrome 확장은 임의 절대 경로에 쓸 수 없어, 사용자가 한 번 선택한      */
+  /* 폴더 핸들을 IndexedDB에 보관하고 settings.json/로그를 직접 덮어쓴다. */
+  /* ------------------------------------------------------------------ */
+  const PROJECT_SETTINGS_FILE = 'settings.json';
+  const FS_DB_NAME = 'tmdbCrawlerFS';
+  const FS_DB_STORE = 'handles';
+  const PROJECT_DIR_KEY = 'projectDir';
+  let projectDir = null;
+
+  function fsDb() {
+    return new Promise((resolve, reject) => {
+      try {
+        const request = indexedDB.open(FS_DB_NAME, 1);
+        request.onupgradeneeded = () => {
+          if (!request.result.objectStoreNames.contains(FS_DB_STORE)) {
+            request.result.createObjectStore(FS_DB_STORE);
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function fsDbRequest(mode, action) {
+    return fsDb().then(db => new Promise((resolve, reject) => {
+      const tx = db.transaction(FS_DB_STORE, mode);
+      const request = action(tx.objectStore(FS_DB_STORE));
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    }));
+  }
+
+  function loadStoredProjectDir() {
+    if (projectDir) return Promise.resolve(projectDir);
+    return fsDbRequest('readonly', store => store.get(PROJECT_DIR_KEY))
+      .then(handle => {
+        if (handle && typeof handle.queryPermission === 'function') projectDir = handle;
+        return projectDir;
+      })
+      .catch(() => null);
+  }
+
+  function storeProjectDir(handle) {
+    projectDir = handle;
+    return fsDbRequest('readwrite', store => store.put(handle, PROJECT_DIR_KEY)).catch(() => {});
+  }
+
+  async function pickProjectDir() {
+    if (!window.showDirectoryPicker) {
+      toast('❌ 이 브라우저는 폴더 직접 저장을 지원하지 않습니다.', 'error');
+      return null;
+    }
+    try {
+      // 사용자 클릭(제스처) 안에서 호출해야 폴더 선택창이 열린다.
+      const handle = await window.showDirectoryPicker({
+        id: 'tmdb-crawler-project',
+        mode: 'readwrite',
+        startIn: 'documents'
+      });
+      await storeProjectDir(handle);
+      updateProjectStatus();
+      log('폴더 연결', handle.name);
+      toast('📁 프로젝트 폴더 연결됨: ' + handle.name);
+      return handle;
+    } catch (error) {
+      if (error && error.name !== 'AbortError') {
+        toast('❌ 폴더 연결 실패: ' + errorMessage(error), 'error');
+      }
+      return null;
+    }
+  }
+
+  async function ensureProjectDir(interactive) {
+    const handle = await loadStoredProjectDir();
+    if (!handle) return null;
+    try {
+      const options = { mode: 'readwrite' };
+      const permission = await handle.queryPermission(options);
+      if (permission === 'granted') return handle;
+      if (!interactive) return null;
+      const requested = await handle.requestPermission(options);
+      return requested === 'granted' ? handle : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function writeProjectFile(filename, text) {
+    const handle = await ensureProjectDir(true);
+    if (!handle) {
+      return { ok: false, error: '프로젝트 폴더가 연결되지 않았습니다. [폴더 연결]을 먼저 눌러 주세요.' };
+    }
+    try {
+      const fileHandle = await handle.getFileHandle(filename, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      return { ok: true, filename: filename, dirName: handle.name };
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+  }
+
+  async function readProjectFile(filename) {
+    const handle = await ensureProjectDir(false);
+    if (!handle) return null;
+    try {
+      const fileHandle = await handle.getFileHandle(filename);
+      const file = await fileHandle.getFile();
+      return await file.text();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function updateProjectStatus() {
+    if (!els.dir) return;
+    els.dir.textContent = '프로젝트 폴더: ' + (projectDir ? projectDir.name + ' (settings.json/로그 직접 저장)' : '(연결 안 됨 · [폴더 연결] 필요)');
   }
 
   function serializeQueue() {
@@ -910,11 +1044,12 @@
     return { saved: saved, failed: failed };
   }
 
+  // 로그는 항상 프로젝트 폴더 루트에 직접 저장한다(다운로드 아님).
   function logFileName() {
     const now = new Date();
     const pad = value => String(value).padStart(2, '0');
     const stamp = now.getFullYear() + pad(now.getMonth() + 1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
-    return safeFolder() + '/crawl-log-' + stamp + '.log';
+    return 'crawl-log-' + stamp + '.log';
   }
 
   async function downloadLog(silent) {
@@ -935,8 +1070,25 @@
     ].join('\n');
 
     const filename = logFileName();
-    const result = await downloadText(header + state.logs.join('\n') + '\n', filename, 'text/plain', true);
-    if (!silent) toast(result.ok ? '📝 ' + filename + ' 저장 완료' : '❌ 로그 저장 실패', result.ok ? 'success' : 'error');
+    const text = header + state.logs.join('\n') + '\n';
+    let result = await writeProjectFile(filename, text);
+    let fallback = false;
+
+    // 폴더 미연결/권한 만료 시에만 기존 다운로드 방식으로 보존한다.
+    if (!result.ok) {
+      const backup = await downloadText(text, safeFolder() + '/' + filename, 'text/plain', true);
+      if (backup.ok) {
+        result = { ok: true, filename: filename, fallback: true };
+        fallback = true;
+      }
+    }
+
+    if (!silent) {
+      const message = result.ok
+        ? (fallback ? '📝 ' + filename + ' (폴더 미연결 → 다운로드 폴더)' : '📝 ' + filename + ' 저장 완료')
+        : '❌ 로그 저장 실패';
+      toast(message, result.ok ? 'success' : 'error');
+    }
     return result;
   }
 
@@ -1294,6 +1446,34 @@
     return payload;
   }
 
+  // 저장 직전 데이터 개수를 로그에 남겨 누락 여부를 바로 비교할 수 있게 한다.
+  function logDataSummary(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const count = value => Array.isArray(value) ? value.length : 0;
+    const credits = payload.credits || {};
+    const images = payload.images || {};
+    const posterCount = count(images.posters);
+    const backdropCount = count(images.backdrops);
+    const posterTotal = Number(payload.posterCount) || 0;
+    const backdropTotal = Number(payload.backdropCount) || 0;
+
+    log('데이터', 'cast ' + count(credits.cast) + ' · crew ' + count(credits.crew)
+      + ' · topBilled ' + count(payload.topBilledCast)
+      + ' · videos ' + count(payload.videos)
+      + ' · posters ' + posterCount + (posterTotal ? '/' + posterTotal : '')
+      + ' · backdrops ' + backdropCount + (backdropTotal ? '/' + backdropTotal : '')
+      + ' · releases ' + count(payload.releases)
+      + ' · lang ' + count(payload.spokenLanguages)
+      + (payload.originalLanguageCode ? ' (' + payload.originalLanguageCode + ')' : ''));
+
+    if (posterTotal > 20 && posterCount < Math.max(5, Math.ceil(posterTotal * 0.1))) {
+      log('이미지 누락 의심', '포스터 ' + posterCount + '/' + posterTotal + ' — 갤러리 요청 실패 가능');
+    }
+    if (backdropTotal > 20 && backdropCount < Math.max(5, Math.ceil(backdropTotal * 0.1))) {
+      log('이미지 누락 의심', '배경 ' + backdropCount + '/' + backdropTotal + ' — 갤러리 요청 실패 가능');
+    }
+  }
+
   async function processEntry(entry, target) {
     const api = ext();
     if (!api.extractMediaData || !api.extractPersonData) {
@@ -1336,9 +1516,12 @@
       cast: true,
       videos: true,
       releases: true,
-      wikidata: true,
-      allLanguages: settings.allLanguages === true
+      wikidata: settings.useWikidata !== false,
+      allLanguages: settings.allLanguages === true,
+      omdbApiKey: settings.omdbApiKey || ''
     });
+
+    logDataSummary(payload);
 
     const saved = await savePayload(target, entry, payload);
 
@@ -1787,18 +1970,57 @@
     return { ok: true };
   }
 
+  // 패널의 [Python 보강 실행] → background에 네이티브 호스트 실행을 요청한다.
+  function runPythonEnricher() {
+    return new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ action: 'startPythonEnricher' }, response => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve(response || { ok: false, error: 'no response' });
+        });
+      } catch (error) {
+        resolve({ ok: false, error: String(error) });
+      }
+    }).then(result => {
+      if (result && result.ok) {
+        log('Python', '보강 watcher 실행 요청');
+        toast('🐍 Python 보강을 시작했습니다.');
+      } else {
+        const message = (result && result.error) || 'native/install.ps1 설치 필요';
+        log('Python', '실행 실패: ' + message);
+        toast('❌ Python 실행 실패: ' + message, 'error');
+      }
+      return result;
+    });
+  }
+
+  // 방문기록만 초기화한다. 같은 작품을 다시 큐에 넣어 재크롤링할 수 있다.
+  async function resetVisited() {
+    visited.clear();
+    recentVisited.length = 0;
+    await saveState(true);
+    updatePanel();
+    log('초기화', '방문기록을 비웠습니다(재크롤링 가능).');
+    toast('🧹 방문기록을 초기화했습니다. 같은 작품을 다시 추가할 수 있습니다.');
+    return { ok: true };
+  }
+
+  // [설정 저장] → 프로젝트 폴더의 settings.json을 직접 덮어쓴다(다운로드 아님).
   async function exportSettings() {
-    const payload = {
-      app: 'tmdb-json-extractor',
-      kind: 'crawler-settings',
-      schemaVersion: '1.7',
-      savedAt: new Date().toISOString(),
-      settings: settings
-    };
-    const filename = safeFolder() + '/crawler-settings.json';
-    const result = await downloadText(JSON.stringify(payload, null, 2), filename, 'application/json', true);
-    log('설정 저장', filename);
-    toast(result.ok ? '⚙ ' + filename + ' 저장 완료' : '❌ 설정 저장 실패', result.ok ? 'success' : 'error');
+    // settings.json은 저장소에 커밋될 수 있으므로 API 키는 제외한다.
+    const fileSettings = Object.assign({}, settings);
+    delete fileSettings.omdbApiKey;
+    const result = await writeProjectFile(PROJECT_SETTINGS_FILE, JSON.stringify(fileSettings, null, 2) + '\n');
+    if (result.ok) {
+      log('설정 저장', PROJECT_SETTINGS_FILE);
+      toast('⚙ ' + PROJECT_SETTINGS_FILE + ' 저장 완료 (' + result.dirName + ')');
+    } else {
+      log('설정 저장 실패', result.error);
+      toast('❌ 설정 저장 실패: ' + result.error, 'error');
+    }
     return result;
   }
 
@@ -1810,23 +2032,34 @@
     next.sitemapKinds = Object.assign({}, DEFAULT_SETTINGS.sitemapKinds, (raw && raw.sitemapKinds) || {});
     if (!next.folder) next.folder = DEFAULT_SETTINGS.folder;
     next.peoplePerTitle = clampPeoplePerTitle(next.peoplePerTitle);
+    // 이미지 저장은 현재 비활성화, 로그 자동 저장은 항상 켜짐
+    next.saveImages = false;
+    next.autoLog = true;
+    next.omdbApiKey = String(next.omdbApiKey || '').trim();
+    next.useWikidata = next.useWikidata !== false;
     return next;
   }
 
-  async function importSettings(file) {
-    if (!file) return { ok: false };
+  // [설정 불러오기] → 프로젝트 폴더의 settings.json을 읽는다.
+  async function importSettings() {
+    const text = await readProjectFile(PROJECT_SETTINGS_FILE);
+    if (!text) {
+      toast('❌ settings.json을 읽을 수 없습니다. [폴더 연결]과 권한을 확인하세요.', 'error');
+      return { ok: false };
+    }
     try {
-      const text = await file.text();
       const parsed = JSON.parse(text);
       const raw = (parsed && parsed.settings) ? parsed.settings : parsed;
+      const retainedOmdbKey = settings.omdbApiKey || '';
       settings = normalizeSettings(raw);
+      if (retainedOmdbKey) settings.omdbApiKey = retainedOmdbKey;
       await saveSettings();
       pruneQueue();
       applyPacing();
       syncSettingsInputs();
       updatePanel();
-      log('설정 불러오기', file.name || 'settings.json');
-      toast('⚙ 설정을 불러왔습니다: ' + (file.name || 'settings.json'));
+      log('설정 불러오기', PROJECT_SETTINGS_FILE);
+      toast('⚙ settings.json을 불러왔습니다.');
       return { ok: true };
     } catch (error) {
       log('설정 불러오기 실패', errorMessage(error));
@@ -1913,6 +2146,7 @@
         <button id="tmdb-crawl-min" title="접기" style="background:none;border:0;color:#9a9ab5;cursor:pointer;font-size:14px">–</button>
       </div>
       <div id="tmdb-crawl-body" style="padding:10px 12px;max-height:calc(100vh - 150px);overflow:auto">
+        <button data-crawl="python" title="네이티브 호스트로 Python 보강 watcher를 실행합니다" style="width:100%;margin-bottom:8px;padding:7px;border-radius:8px;border:1px solid #4a3f7a;background:#221a3a;color:#c9b8ff;cursor:pointer">🐍 Python 보강 실행 (수동 로드)</button>
         <div style="display:flex;justify-content:space-between"><span style="color:#9a9ab5">대기열</span><b id="tmdb-crawl-queue">0</b></div>
         <div style="display:flex;justify-content:space-between"><span style="color:#9a9ab5">완료 / 실패</span><b id="tmdb-crawl-done">0 / 0</b></div>
         <div style="display:flex;justify-content:space-between"><span style="color:#9a9ab5">저장</span><b id="tmdb-crawl-types">영화 0 · TV 0 · 인물 0</b></div>
@@ -1928,10 +2162,12 @@
           <button data-crawl="seed" style="padding:6px;border-radius:8px;border:1px solid #2f3f6f;background:#141c35;color:#9bb8ff;cursor:pointer">큐에 추가</button>
           <button data-crawl="save" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:#1e1e30;color:#d7d7ea;cursor:pointer">현재 저장</button>
           <button data-crawl="clear" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:#1e1e30;color:#d7d7ea;cursor:pointer">큐 비우기</button>
+          <button data-crawl="resetVisited" title="방문기록을 비워 같은 작품을 다시 크롤링할 수 있게 합니다" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:#1e1e30;color:#d7d7ea;cursor:pointer">방문기록 초기화</button>
           <button data-crawl="log" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:rgba(30,30,48,.75);color:#d7d7ea;cursor:pointer">로그 저장</button>
           <button data-crawl="index" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:rgba(30,30,48,.75);color:#d7d7ea;cursor:pointer">인덱스 내보내기</button>
           <button data-crawl="settingsSave" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:rgba(30,30,48,.75);color:#d7d7ea;cursor:pointer">설정 저장</button>
           <button data-crawl="settingsLoad" style="padding:6px;border-radius:8px;border:1px solid #3a3a5c;background:rgba(30,30,48,.75);color:#d7d7ea;cursor:pointer">설정 불러오기</button>
+          <button data-crawl="connect" style="grid-column:1 / -1;padding:6px;border-radius:8px;border:1px solid #2f6f4a;background:#14351f;color:#7bed9f;cursor:pointer">폴더 연결 (settings.json/로그 직접 저장)</button>
         </div>
         <div style="margin-top:10px;border-top:1px solid #2b2b44;padding-top:8px">
           <div style="color:#9a9ab5;margin-bottom:4px">수집 대상 (저장)</div>
@@ -1968,6 +2204,10 @@
             </select>
           </label>
           <label><input type="checkbox" data-opt="allLanguages"> 모든 언어 포스터/배경 (끄면 1개 언어)</label>
+          <label><input type="checkbox" data-opt="useWikidata"> Wikidata 보조 데이터 수집 (회사·국가·언어·IMDb ID)</label>
+          <label style="display:flex;align-items:center;gap:6px">OMDb API 키
+            <input type="password" data-opt="omdbApiKey" placeholder="선택 · 확장 저장소에만 저장" autocomplete="off" style="width:150px;background:#1e1e30;color:#e9e9f2;border:1px solid #3a3a5c;border-radius:6px;padding:2px 4px">
+          </label>
           <label><input type="checkbox" data-opt="collectFilmography"> 인물 필모그래피 작품 수집</label>
           <label style="display:flex;align-items:center;gap:6px;padding-left:18px">작품당 인물
             <input type="number" data-opt="peoplePerTitle" min="0" max="500" step="1" title="작품 하나를 저장할 때 인물 큐에 넣을 최대 인원 (0 = 무제한)" style="width:60px;background:#1e1e30;color:#e9e9f2;border:1px solid #3a3a5c;border-radius:6px;padding:2px 4px">
@@ -1982,8 +2222,7 @@
             개
           </label>
           <label><input type="checkbox" data-opt="overwrite"> 중복 파일 덮어쓰기 (끄면 건너뜀)</label>
-          <label><input type="checkbox" data-opt="saveImages" title="포스터/배경/프로필 전체를 저장합니다(작품당 수백 장일 수 있음)"> 이미지도 저장 (JSON 이름 폴더, 파일명=제목)</label>
-          <label><input type="checkbox" data-opt="autoLog"> 종료 시 로그 파일 자동 저장</label>
+          <label style="color:#7c7c96">이미지 저장: 비활성화됨 · 로그 자동 저장: 항상 켜짐</label>
           <label><input type="checkbox" data-opt="humanize"> 사람처럼 (랜덤 스크롤·휴식)</label>
           <label><input type="checkbox" data-opt="readDelay"> 본문 길이만큼 읽는 시간 추가</label>
           <label style="display:flex;align-items:center;gap:6px">페이지 대기
@@ -2004,8 +2243,8 @@
           <summary style="cursor:pointer;color:#9a9ab5">작업 로그 보기</summary>
           <pre id="tmdb-crawl-logtext" style="margin:6px 0 0;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all;font:11px/1.5 ui-monospace,Consolas,monospace;color:#b6b6d0">(로그 없음)</pre>
         </details>
-        <input type="file" id="tmdb-crawl-settings-file" accept="application/json,.json" style="display:none">
-        <div style="margin-top:8px;color:#7c7c96">저장 위치: 다운로드/&lt;폴더&gt;/movie-1368337-the-odyssey.json<br>기본 페이싱 기준 대략 100~200작품/시간<br>설정은 확장 저장소에 자동 저장되고 시작 시 자동으로 불러옵니다. [설정 저장]은 백업 파일 내보내기입니다.</div>
+        <div id="tmdb-crawl-dir" style="margin-top:8px;color:#9bb8ff">프로젝트 폴더: (연결 안 됨)</div>
+        <div style="margin-top:4px;color:#7c7c96">JSON: 다운로드/&lt;폴더&gt;/movie-1368337-the-odyssey.json (기존 방식)<br>settings.json/로그: [폴더 연결]로 선택한 프로젝트 폴더에 직접 덮어씀 (다운로드 아님)<br>설정은 시작 시 자동으로 다시 읽습니다. 기본 페이싱 기준 대략 100~200작품/시간.</div>
       </div>
     `;
 
@@ -2016,20 +2255,20 @@
       const button = event.target.closest('button[data-crawl]');
       if (button) {
         const action = button.getAttribute('data-crawl');
-        if (action === 'start') startCrawl(true);
+        if (action === 'python') runPythonEnricher();
+        else if (action === 'start') startCrawl(true);
         else if (action === 'pause') togglePause();
         else if (action === 'stop') stopCrawl();
         else if (action === 'seed') seedCurrent();
         else if (action === 'save') saveCurrentOnly();
         else if (action === 'clear') clearQueue();
+        else if (action === 'resetVisited') resetVisited();
         else if (action === 'index') exportIndex();
         else if (action === 'sitemap') seedSitemap();
+        else if (action === 'connect') pickProjectDir();
         else if (action === 'log') downloadLog(false);
         else if (action === 'settingsSave') exportSettings();
-        else if (action === 'settingsLoad') {
-          const fileInput = panel.querySelector('#tmdb-crawl-settings-file');
-          if (fileInput) fileInput.click();
-        }
+        else if (action === 'settingsLoad') importSettings();
         return;
       }
 
@@ -2082,14 +2321,6 @@
       });
     });
 
-    const settingsFile = panel.querySelector('#tmdb-crawl-settings-file');
-    if (settingsFile) {
-      settingsFile.addEventListener('change', () => {
-        const file = (settingsFile.files && settingsFile.files[0]) || null;
-        importSettings(file);
-        settingsFile.value = '';
-      });
-    }
   }
 
   function cacheEls() {
@@ -2103,7 +2334,8 @@
       elapsed: panel.querySelector('#tmdb-crawl-elapsed'),
       sitemap: panel.querySelector('#tmdb-crawl-sitemap'),
       next: panel.querySelector('#tmdb-crawl-next'),
-      logText: panel.querySelector('#tmdb-crawl-logtext')
+      logText: panel.querySelector('#tmdb-crawl-logtext'),
+      dir: panel.querySelector('#tmdb-crawl-dir')
     };
   }
 
@@ -2197,8 +2429,11 @@
       restoreQueue(savedState.queue);
     }
 
+    // 저장해 둔 프로젝트 폴더 핸들을 먼저 불러온다(직접 저장/자동 읽기용).
+    await loadStoredProjectDir();
+
     // 시작할 때 설치 폴더의 settings.json + 저장된 설정을 읽는다.
-    // 우선순위: 저장된 설정(UI에서 바꾼 값) > settings.json > 내장 기본값
+    // 우선순위: 프로젝트 폴더 settings.json > 설치 폴더 settings.json > 저장된 설정 > 내장 기본값
     const packaged = await requestPackagedSettings();
     const packagedSettings = (packaged && packaged.settings && typeof packaged.settings === 'object')
       ? packaged.settings
@@ -2211,14 +2446,36 @@
       : null;
     // settings.json을 편집했다면 파일 값이 우선하고, 그렇지 않으면 UI에서 바꾼 저장값이 우선한다
     const fileChanged = !!(packagedSettings && packagedHash && packagedHash !== savedHash);
+    const retainedOmdbKey = (stored && stored.omdbApiKey) || '';
     settings = normalizeSettings(Object.assign({}, packagedSettings || {}, fileChanged ? {} : (stored || {})));
+    // API 키는 settings.json에 저장하지 않으므로, 파일 우선 적용 시에도 chrome.storage의 키를 유지한다.
+    if (retainedOmdbKey) settings.omdbApiKey = retainedOmdbKey;
     if (fileChanged || !stored) await saveSettings();
     if (packagedHash && packagedHash !== savedHash) await storageSet({ [SETTINGS_HASH_KEY]: packagedHash });
+
+    // 프로젝트 폴더의 settings.json(직접 저장본)이 있으면 시작 시 자동으로 읽는다.
+    const currentOmdbKey = settings.omdbApiKey || '';
+    const diskSettingsText = await readProjectFile(PROJECT_SETTINGS_FILE);
+    if (diskSettingsText) {
+      try {
+        const diskParsed = JSON.parse(diskSettingsText);
+        const diskRaw = (diskParsed && diskParsed.settings) ? diskParsed.settings : diskParsed;
+        if (diskRaw && typeof diskRaw === 'object') {
+          settings = normalizeSettings(diskRaw);
+          if (currentOmdbKey) settings.omdbApiKey = currentOmdbKey;
+          await saveSettings();
+          log('설정 자동 불러오기', PROJECT_SETTINGS_FILE);
+        }
+      } catch (error) {
+        log('설정 자동 불러오기 실패', errorMessage(error));
+      }
+    }
 
     pruneQueue();
     applyPacing();
     buildPanel();
     syncSettingsInputs();
+    updateProjectStatus();
     updatePanel();
 
     setInterval(() => {

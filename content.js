@@ -354,12 +354,160 @@ function dedupeImagesByFilename(items) {
       order.push(name);
       return;
     }
-    if (getImageWidthRank(item.url) > getImageWidthRank(byName[name].url)) {
-      byName[name] = item;
-    }
+    const existing = byName[name];
+    const useNew = getImageWidthRank(item.url) > getImageWidthRank(existing.url);
+    const winner = useNew ? item : existing;
+    const loser = useNew ? existing : item;
+
+    // URL은 큰 해상도를 유지하되, 다른 항목에만 있는 메타데이터는 합친다.
+    Object.keys(loser).forEach(key => {
+      if (key === 'url') return;
+      const value = loser[key];
+      if (value === null || value === undefined || value === '') return;
+      if (winner[key] === null || winner[key] === undefined || winner[key] === '') {
+        winner[key] = value;
+      } else if (key === 'urls' && typeof value === 'object' && typeof winner[key] === 'object') {
+        winner[key] = Object.assign({}, value, winner[key]);
+      }
+    });
+
+    byName[name] = winner;
   });
 
   return order.map(name => byName[name]);
+}
+
+// ===== Media 섹션(인기 미디어) 정적 자산 =====
+// 초기 HTML에는 Most Popular 탭의 예고편 1(CSS background-image) + 배경 1 + 포스터 1만 있다.
+function extractMediaSection() {
+  const result = { tabs: [], items: [] };
+  const section = document.querySelector('section.panel.media_panel.media, section.media_panel.media');
+  if (!section) return result;
+
+  const menu = section.querySelector('.menu');
+  if (menu) {
+    menu.querySelectorAll('a[id]').forEach(link => {
+      const span = link.querySelector('span');
+      const countText = span ? span.textContent.trim() : '';
+      const label = span ? link.textContent.replace(span.textContent, '').trim() : link.textContent.trim();
+      const listItem = link.closest('li');
+      result.tabs.push({
+        id: link.id,
+        label: label.replace(/\s+/g, ' '),
+        count: toNumber(countText),
+        href: link.getAttribute('href') || '',
+        active: link.classList.contains('active') || !!(listItem && listItem.classList.contains('active'))
+      });
+    });
+  }
+
+  const root = section.querySelector('#media_scroller') ||
+    section.querySelector('.h_scroller.content') ||
+    section;
+
+  root.querySelectorAll('a.play_trailer[data-id], .video.card a[data-id]').forEach(link => {
+    const wrapper = link.closest('.wrapper');
+    let background = wrapper ? wrapper.style.backgroundImage : '';
+    if (!background && wrapper) {
+      try { background = window.getComputedStyle(wrapper).backgroundImage; } catch (e) {}
+    }
+    const match = String(background || '').match(/url\(["']?([^"')]+)["']?\)/);
+    const card = link.closest('.video.card') || link.closest('.video');
+
+    result.items.push({
+      tab: 'popular',
+      type: 'video',
+      src: match ? match[1] : '',
+      srcset: '',
+      alt: '',
+      classes: card ? card.className : '',
+      parent_classes: (card && card.parentElement) ? card.parentElement.className : '',
+      data_site: link.getAttribute('data-site') || '',
+      data_id: link.getAttribute('data-id') || '',
+      data_title: link.getAttribute('data-title') || '',
+      href: link.getAttribute('href') || ''
+    });
+  });
+
+  root.querySelectorAll('img.backdrop, img.poster').forEach(img => {
+    // img 자체에도 .backdrop/.poster 클래스가 있어 closest()는 자기 자신이 된다.
+    // 구조 기록은 실제 부모 컨테이너(div.backdrop/div.poster)를 사용한다.
+    const parent = img.parentElement || img;
+    const isBackdrop = img.classList.contains('backdrop') ||
+      !!(parent && parent.classList.contains('backdrop'));
+
+    result.items.push({
+      tab: 'popular',
+      type: isBackdrop ? 'backdrop' : 'poster',
+      src: img.getAttribute('src') || '',
+      srcset: img.getAttribute('srcset') || '',
+      alt: img.getAttribute('alt') || '',
+      classes: img.className || '',
+      parent_classes: parent ? parent.className : ''
+    });
+  });
+
+  return result;
+}
+
+// ===== Top Billed Cast 섹션(정적 렌더링) =====
+function extractTopBilledCast() {
+  const rows = [];
+  const section = document.querySelector('section.panel.top_billed, section.top_billed');
+  if (!section) return rows;
+
+  const list = section.querySelector('#cast_scroller ol.people.scroller, #cast_scroller ol.people, ol.people.scroller');
+  if (!list) return rows;
+
+  list.querySelectorAll('li.card').forEach(card => {
+    if (card.classList.contains('filler') || card.classList.contains('view_more')) return;
+
+    const personLink = card.querySelector('a[href*="/person/"]');
+    const href = personLink ? (personLink.getAttribute('href') || '') : '';
+    const match = href.match(/\/person\/(\d+)(?:-([^/?#]*))?/);
+    if (!match) return;
+
+    const personId = Number(match[1]);
+    const personSlug = match[2] || '';
+    const nameLink = card.querySelector('p a') || personLink;
+    const name = nameLink ? nameLink.textContent.trim() : '';
+    if (!name) return;
+
+    const characterEl = card.querySelector('p.character');
+    const img = card.querySelector('img.profile, img');
+    const wrapper = card.querySelector('div.profile, .glyphicons.profile');
+    let placeholderClass = '';
+    if (wrapper) {
+      if (wrapper.classList.contains('one')) placeholderClass = 'one';
+      else if (wrapper.classList.contains('two')) placeholderClass = 'two';
+    }
+
+    rows.push({
+      order: rows.length + 1,
+      person_id: personId,
+      person_slug: personSlug,
+      name: name,
+      character: characterEl ? characterEl.textContent.trim() : '',
+      profile_src: img ? normalizeImageUrl(img.getAttribute('src') || '') : '',
+      profile_srcset: img ? (img.getAttribute('srcset') || '') : '',
+      alt: img ? (img.getAttribute('alt') || '') : '',
+      placeholder_class: placeholderClass,
+      profile_url: 'https://www.themoviedb.org/person/' + personId + (personSlug ? '-' + personSlug : '')
+    });
+  });
+
+  return rows;
+}
+
+// ===== 보강 실패 보고 (콘솔 + 크롤러 로그) =====
+function reportEnrichmentIssue(message, error) {
+  const detail = (error && (error.message || String(error))) || '';
+  try {
+    console.warn('[TMDB] ' + message, error || '');
+  } catch (e) {}
+  try {
+    if (typeof window.__tmdbEnrichWarn === 'function') window.__tmdbEnrichWarn(message, detail);
+  } catch (e) {}
 }
 
 // ===== TMDB 하위 페이지/이미지 헬퍼 =====
@@ -415,7 +563,10 @@ function collectYoutubeLinks(texts, urls) {
     }
   });
 
-  (Array.isArray(urls) ? urls : []).forEach(url => add(url, '', 'video'));
+  (Array.isArray(urls) ? urls : []).forEach(item => {
+    if (item && typeof item === 'object') add(item.url, item.title, 'video');
+    else add(item, '', 'video');
+  });
   return rows;
 }
 
@@ -425,6 +576,55 @@ function buildImageVariants(originalUrl, displayToken, highToken) {
     high: replaceImageSize(originalUrl, highToken),
     original: replaceImageSize(originalUrl, 'original')
   };
+}
+
+// DOM에서만 수집된 이미지에도 공통 메타 필드를 보장한다.
+function ensureImageMetadata(items) {
+  (items || []).forEach(item => {
+    const name = getImageFilename(item.url);
+    if (!item.file_path) item.file_path = name ? '/' + name : '';
+    if (!('id' in item)) item.id = null;
+    if (!('iso_639_1' in item)) item.iso_639_1 = null;
+    if (!('width' in item)) item.width = null;
+    if (!('height' in item)) item.height = null;
+    if (!('aspect_ratio' in item)) item.aspect_ratio = null;
+  });
+}
+
+function buildPaginationInfo(collected, total) {
+  const results = Math.max(0, Number(total) || 0);
+  const count = Math.max(0, Number(collected) || 0);
+  const perPage = count > 0 ? count : 1;
+  return {
+    page: 1,
+    per_page: perPage,
+    total_pages: results > 0 ? Math.ceil(results / perPage) : 0,
+    total_results: results
+  };
+}
+
+function buildCreditGroups(data) {
+  const directors = [];
+  const writers = [];
+  (data.credits.crew || []).forEach(member => {
+    const job = String(member.job || '').toLowerCase();
+    const row = { id: member.id || null, name: member.name };
+
+    const isDirector = job.includes('director') &&
+      !job.includes('assistant') && !job.includes('second') && !job.includes('casting') &&
+      !job.includes('art') && !job.includes('photography') && !job.includes('cinematographer') &&
+      !job.includes('photographer');
+    if (isDirector && !directors.some(existing => existing.name === row.name)) directors.push(row);
+
+    if ((job.includes('writer') || job.includes('screenplay') || job.includes('story')) &&
+      !job.includes('storyboard') &&
+      !writers.some(existing => existing.name === row.name)) {
+      writers.push(row);
+    }
+  });
+
+  data.credits.directors = directors;
+  data.credits.writers = writers;
 }
 
 function delay(ms) {
@@ -617,16 +817,34 @@ async function getGalleryLanguages(kind, basePath) {
   return codes;
 }
 
+// 갤러리 언어 링크와 각 언어의 이미지 수를 함께 돌려준다(많은 순).
+async function getGalleryLanguagePairs(kind, basePath) {
+  const doc = await fetchHtmlDoc(`${basePath}/images/${kind}`);
+  const pairs = [];
+  doc.querySelectorAll('a[href*="image_language"]').forEach(anchor => {
+    const match = (anchor.getAttribute('href') || '').match(/image_language=([a-zA-Z-]+)/);
+    const code = match ? match[1] : '';
+    if (!code || code === 'xx') return;
+    if (pairs.some(pair => pair.code === code)) return;
+
+    const countMatch = anchor.textContent.trim().match(/(\d+)\s*$/);
+    pairs.push({ code: code, count: countMatch ? Number(countMatch[1]) : 0 });
+  });
+  return pairs.sort((a, b) => b.count - a.count);
+}
+
 // 갤러리 언어 필터를 모두 순회해 이미지 URL을 모은다.
-// allLanguages=true 이면 TMDB가 제공하는 언어 전부(+xx), false(기본값) 이면 사이트 언어 1종만 본다.
+// allLanguages=true 이면 모든 언어를, false(기본값)면 기본+xx+en 후
+// 목표 개수(탭 카운트)에 도달할 때까지 언어를 추가로 순회한다.
 async function fetchGalleryUrls(kind, basePath, options) {
   const allLanguages = !!(options && options.allLanguages === true);
+  const targetCount = Number(options && options.targetCount) || 0;
   const locale = pageLocale();
   if (!window.__tmdbGalleryCache) window.__tmdbGalleryCache = {};
-  const cacheKey = `${basePath}/images/${kind}|${allLanguages ? 'all' : locale || 'basic'}`;
+  const cacheKey = `${basePath}/images/${kind}|v2|${allLanguages ? 'all' : (locale || 'basic') + '|t' + targetCount}`;
   const cached = window.__tmdbGalleryCache[cacheKey];
   if (cached && (Date.now() - cached.ts) < 10 * 60 * 1000) {
-    return cached.urls.slice();
+    return (cached.items || []).slice();
   }
 
   const variants = [''];
@@ -635,21 +853,72 @@ async function fetchGalleryUrls(kind, basePath, options) {
       const codes = await getGalleryLanguages(kind, basePath);
       codes.forEach(code => variants.push('?image_language=' + encodeURIComponent(code)));
     } catch (error) {
-      console.warn(`TMDB ${kind} 언어 목록 수집 실패:`, error);
+      reportEnrichmentIssue(`TMDB ${kind} 언어 목록 수집 실패`, error);
     }
     if (!variants.includes('?image_language=xx')) variants.push('?image_language=xx');
   } else {
-    // 선택한 언어의 갤러리 1종만 수집한다(요청 1회)
-    const short = String(locale || '').split('-')[0].toLowerCase();
-    if (short) {
-      variants.length = 0;
-      variants.push('?image_language=' + encodeURIComponent(short));
-    }
+    // 갤러리는 언어별로 나뉜다. 1개 언어만 보면 포스터/배경이 1~2장만 남으므로
+    // 기본(사이트 언어) + 언어 없음(xx) + 영어(en)를 함께 수집한다(요청 3회).
+    variants.length = 0;
+    variants.push('');
+    variants.push('?image_language=xx');
+    variants.push('?image_language=en');
   }
   const uniqueVariants = Array.from(new Set(variants));
 
-  const seen = {};
-  const urls = [];
+  const records = {};
+
+  function languageCodeForVariant(variant) {
+    const match = String(variant || '').match(/image_language=([a-zA-Z-]+)/);
+    if (match) return match[1] === 'xx' ? null : match[1];
+    const localeCode = String(pageLocale() || '').split('-')[0].toLowerCase();
+    return localeCode || null;
+  }
+
+  function collectFromDoc(doc, variant) {
+    const languageCode = languageCodeForVariant(variant);
+    let anchors = doc.querySelectorAll('.card a[href*="/t/p/"]');
+    if (anchors.length === 0) anchors = doc.querySelectorAll('a[href*="/t/p/"]');
+
+    anchors.forEach(anchor => {
+      const href = normalizeImageUrl(anchor.getAttribute('href'));
+      const name = getImageFilename(href);
+      if (!href || !name) return;
+
+      if (records[name]) {
+        if (!records[name].iso_639_1 && languageCode) records[name].iso_639_1 = languageCode;
+        return;
+      }
+
+      const card = anchor.closest('.card');
+      let imageId = '';
+      let width = null;
+      let height = null;
+      if (card) {
+        imageId = card.getAttribute('data-image-id') || card.id || '';
+        const sizeMatch = card.textContent.match(/(\d{2,5})\s*[x×]\s*(\d{2,5})/);
+        if (sizeMatch) {
+          width = Number(sizeMatch[1]);
+          height = Number(sizeMatch[2]);
+        }
+      }
+
+      records[name] = {
+        url: href,
+        file_path: '/' + name,
+        id: imageId || null,
+        iso_639_1: languageCode,
+        width: width,
+        height: height,
+        aspect_ratio: (width && height) ? Number((width / height).toFixed(3)) : null
+      };
+    });
+  }
+
+  function recordCount() {
+    return Object.keys(records).length;
+  }
+
   let index = 0;
   const CONCURRENCY = 1;  // 사람처럼 한 번에 한 요청만 보낸다(429 방지)
 
@@ -658,19 +927,10 @@ async function fetchGalleryUrls(kind, basePath, options) {
       const variant = uniqueVariants[index++];
       try {
         const doc = await fetchHtmlDoc(`${basePath}/images/${kind}${variant}`, undefined, { cache: false });
-        let anchors = doc.querySelectorAll('.card a[href*="/t/p/"]');
-        if (anchors.length === 0) anchors = doc.querySelectorAll('a[href*="/t/p/"]');
-        anchors.forEach(anchor => {
-          const href = normalizeImageUrl(anchor.getAttribute('href'));
-          const name = getImageFilename(href);
-          if (!href || !name || seen[name]) return;
-          seen[name] = true;
-          urls.push(href);
-        });
+        collectFromDoc(doc, variant);
       } catch (error) {
-        console.warn(`TMDB ${kind} 갤러리 수집 실패 (${variant || 'default'}):`, error);
+        reportEnrichmentIssue(`TMDB ${kind} 갤러리 수집 실패 (${variant || 'default'})`, error);
       }
-      await delay(randomBetween(900, 2000));
     }
   }
 
@@ -678,11 +938,47 @@ async function fetchGalleryUrls(kind, basePath, options) {
   for (let i = 0; i < Math.min(CONCURRENCY, uniqueVariants.length); i++) workers.push(worker());
   await Promise.all(workers);
 
-  window.__tmdbGalleryCache[cacheKey] = { ts: Date.now(), urls: urls.slice() };
-  return urls;
+  // 단일 언어 모드: 탭 카운트(전체 라이브러리 수)에 못 미치면 언어를 추가 순회한다.
+  if (!allLanguages && targetCount > 0 && recordCount() < targetCount) {
+    const fetchedCodes = {};
+    uniqueVariants.forEach(variant => {
+      const match = variant.match(/image_language=([a-zA-Z-]+)/);
+      if (match) fetchedCodes[match[1]] = true;
+    });
+
+    let pairs = [];
+    try {
+      pairs = await getGalleryLanguagePairs(kind, basePath);
+    } catch (error) {
+      reportEnrichmentIssue(`TMDB ${kind} 언어 목록 수집 실패`, error);
+    }
+
+    const MAX_EXTRA_LANGUAGES = 30;
+    let extra = 0;
+    for (const pair of pairs) {
+      if (recordCount() >= targetCount || extra >= MAX_EXTRA_LANGUAGES) break;
+      if (fetchedCodes[pair.code]) continue;
+      fetchedCodes[pair.code] = true;
+      extra += 1;
+      try {
+        const doc = await fetchHtmlDoc(
+          `${basePath}/images/${kind}?image_language=${encodeURIComponent(pair.code)}`,
+          undefined,
+          { cache: false }
+        );
+        collectFromDoc(doc, '?image_language=' + pair.code);
+      } catch (error) {
+        reportEnrichmentIssue(`TMDB ${kind} 갤러리 수집 실패 (${pair.code})`, error);
+      }
+    }
+  }
+
+  const items = Object.values(records);
+  window.__tmdbGalleryCache[cacheKey] = { ts: Date.now(), items: items };
+  return items;
 }
 
-function mergeGalleryImages(data, kind, urls) {
+function mergeGalleryImages(data, kind, items) {
   const isPoster = kind === 'posters';
   const displayToken = isPoster ? 'w500' : 'w780';
   const highToken = isPoster ? 'w780' : 'w1280';
@@ -698,9 +994,28 @@ function mergeGalleryImages(data, kind, urls) {
         original: data.images.backdrops_original
       };
 
-  urls.forEach(url => {
-    const variants = buildImageVariants(url, displayToken, highToken);
-    lists.display.push({ url: variants.display });
+  (items || []).forEach(item => {
+    const record = (typeof item === 'string') ? { url: item } : (item || {});
+    const originalUrl = record.url || '';
+    if (!originalUrl) return;
+
+    const variants = buildImageVariants(originalUrl, displayToken, highToken);
+    const urls = {};
+    urls[displayToken] = variants.display;
+    urls[highToken] = variants.high;
+    urls.original = variants.original;
+
+    const meta = {
+      file_path: record.file_path || ('/' + getImageFilename(originalUrl)),
+      id: record.id || null,
+      iso_639_1: record.iso_639_1 || null,
+      width: record.width || null,
+      height: record.height || null,
+      aspect_ratio: record.aspect_ratio || null,
+      urls: urls
+    };
+
+    lists.display.push(Object.assign({ url: variants.display }, meta));
     lists.high.push({ url: variants.high });
     lists.original.push({ url: variants.original });
   });
@@ -722,21 +1037,23 @@ function mergeGalleryImages(data, kind, urls) {
 
 function getCrewDepartment(role) {
   const roleLower = String(role || '').toLowerCase();
+  // "Director of Photography"는 Directing이 아니라 Camera다( director 검사보다 먼저 )
+  if (roleLower.includes('director of photography') || roleLower.includes('cinematographer') || roleLower.includes('still photographer')) return 'Camera';
+  if (roleLower.includes('art direction') || roleLower.includes('set decoration') || roleLower.includes('production design') || roleLower.includes('art director')) return 'Art';
   if (roleLower.includes('director')) return 'Directing';
   if (roleLower.includes('creator')) return 'Creator';
   if (roleLower.includes('writer') || roleLower.includes('screenplay') || roleLower.includes('story')) return 'Writing';
   if (roleLower.includes('producer')) return 'Production';
-  if (roleLower.includes('cinematographer') || roleLower.includes('director of photography')) return 'Camera';
   if (roleLower.includes('editor')) return 'Editing';
   if (roleLower.includes('music') || roleLower.includes('composer')) return 'Sound';
-  if (roleLower.includes('art director') || roleLower.includes('production design')) return 'Art';
   if (roleLower.includes('costume') || roleLower.includes('makeup') || roleLower.includes('hair')) return 'Costume & Make-Up';
   if (roleLower.includes('visual effects') || roleLower.includes('vfx')) return 'Visual Effects';
   return 'Other';
 }
 
 function normalizeDepartmentLabel(label) {
-  const text = String(label || '').trim();
+  // TMDB h4 제목 뒤에 인원수가 붙는다: "미술 3", "연출 4", "Costume & Make-Up 7"
+  const text = String(label || '').trim().replace(/[\s\d]+$/, '').trim();
   const koreanMap = {
     '미술': 'Art',
     '카메라': 'Camera',
@@ -870,9 +1187,25 @@ async function fetchCastAndCrew(basePath) {
 
       const characterEl = li.querySelector('p.character, .character');
       const imageUrl = getImageSource(li.querySelector('img'));
+      const personMatch = String(nameLink.getAttribute('href') || '').match(/\/person\/(\d+)(?:-([^/?#]*))?/);
+      const orderAttr = li.getAttribute('data-order');
+      const profileWrap = li.querySelector('.glyphicons.picture.profile, .profile');
+      let placeholderClass = '';
+      if (profileWrap) {
+        if (profileWrap.classList.contains('one')) placeholderClass = 'one';
+        else if (profileWrap.classList.contains('two')) placeholderClass = 'two';
+      }
+
       cast.push({
+        id: personMatch ? Number(personMatch[1]) : null,
+        order: orderAttr !== null ? Number(orderAttr) + 1 : cast.length + 1,
+        credit_id: li.getAttribute('data-credit-id') || '',
+        cast_id: li.getAttribute('data-cast-id') ? Number(li.getAttribute('data-cast-id')) : null,
         name: name,
         character: characterEl ? characterEl.textContent.trim() : '',
+        known_for_department: 'Acting',
+        profile_path: imageUrl ? '/' + getImageFilename(imageUrl) : '',
+        placeholder_class: placeholderClass,
         image: imageUrl ? replaceImageSize(imageUrl, 'w276_and_h350_face') : '',
         image_high: imageUrl ? replaceImageSize(imageUrl, 'h632') : '',
         image_original: imageUrl ? replaceImageSize(imageUrl, 'original') : '',
@@ -895,9 +1228,13 @@ async function fetchCastAndCrew(basePath) {
       const job = jobEl ? jobEl.textContent.trim() : '';
       if (!job) return;
 
+      const personMatch = String(nameLink.getAttribute('href') || '').match(/\/person\/(\d+)(?:-([^/?#]*))?/);
+
       job.split(',').map(part => part.trim()).filter(Boolean).forEach(singleJob => {
         if (crew.some(member => member.name === name && member.job === singleJob)) return;
         crew.push({
+          id: personMatch ? Number(personMatch[1]) : null,
+          credit_id: li.getAttribute('data-credit-id') || '',
           name: name,
           job: singleJob,
           department: listedDepartment || getCrewDepartment(singleJob)
@@ -906,19 +1243,52 @@ async function fetchCastAndCrew(basePath) {
     });
   });
 
-  return { cast: cast, crew: crew };
+  let castTotal = cast.length;
+  let crewTotal = crew.length;
+  doc.querySelectorAll('h3').forEach(heading => {
+    const text = heading.textContent.trim();
+    let match = text.match(/(?:출연진|Cast)\s*(\d+)/i);
+    if (match) castTotal = Number(match[1]);
+    match = text.match(/(?:제작진|Crew)\s*(\d+)/i);
+    if (match) crewTotal = Number(match[1]);
+  });
+
+  return { cast: cast, crew: crew, castTotal: castTotal, crewTotal: crewTotal };
 }
 
 function mergeCastAndCrew(data, fetched) {
   fetched.cast.forEach(actor => {
-    if (data.credits.cast.some(existing => existing.name === actor.name)) return;
+    const existing = data.credits.cast.find(row => row.name === actor.name);
+    if (existing) {
+      // 메인 페이지 카드에는 없는 상세 메타를 전체 캐스트 페이지 값으로 보강한다.
+      ['id', 'order', 'credit_id', 'cast_id', 'profile_path', 'placeholder_class', 'known_for_department'].forEach(key => {
+        if ((existing[key] === undefined || existing[key] === null || existing[key] === '') &&
+          actor[key] !== undefined && actor[key] !== null && actor[key] !== '') {
+          existing[key] = actor[key];
+        }
+      });
+      return;
+    }
     data.credits.cast.push(actor);
   });
 
   fetched.crew.forEach(member => {
-    if (data.credits.crew.some(existing => existing.name === member.name && existing.job === member.job)) return;
+    const existing = data.credits.crew.find(row => row.name === member.name && row.job === member.job);
+    if (existing) {
+      ['id', 'credit_id'].forEach(key => {
+        if (!existing[key] && member[key]) existing[key] = member[key];
+      });
+      return;
+    }
     data.credits.crew.push(member);
   });
+
+  if (fetched.castTotal) {
+    data.credits.castTotal = Math.max(Number(data.credits.castTotal) || 0, fetched.castTotal);
+  }
+  if (fetched.crewTotal) {
+    data.credits.crewTotal = Math.max(Number(data.credits.crewTotal) || 0, fetched.crewTotal);
+  }
 }
 
 async function fetchAllVideos(basePath, existingVideos) {
@@ -998,10 +1368,13 @@ async function fetchWikidataEnrichment(page) {
 
   const property = getTmdbWikidataProperty(page.kind);
   // OPTIONAL을 이어 붙이면 카르테시안 곱이 되어 LIMIT에서 잘리므로 UNION으로 분리한다
-  const query = `SELECT ?companyLabel ?countryLabel ?languageLabel ?iso WHERE {
+  const query = `SELECT ?item ?itemLabel ?companyLabel ?countryLabel ?languageLabel ?iso ?imdb ?website WHERE {
     ?item wdt:${property} "${page.id}".
-    { ?item wdt:P272 ?company. } UNION { ?item wdt:P495 ?country. } UNION { ?item wdt:P364 ?language. }
-    OPTIONAL { ?language wdt:P218 ?iso. }
+    { ?item wdt:P272 ?company. } UNION
+    { ?item wdt:P495 ?country. } UNION
+    { ?item wdt:P364 ?language. OPTIONAL { ?language wdt:P218 ?iso. } } UNION
+    { ?item wdt:P345 ?imdb. } UNION
+    { ?item wdt:P856 ?website. }
     SERVICE wikibase:label { bd:serviceParam wikibase:language "ko,en". }
   } LIMIT 500`;
 
@@ -1014,7 +1387,18 @@ async function fetchWikidataEnrichment(page) {
 
   const json = await response.json();
   const bindings = (json.results && json.results.bindings) || [];
-  const enrichment = { companies: [], countries: [], languages: [], languageCode: '' };
+  const enrichment = {
+    entityId: '',
+    entityUrl: '',
+    label: '',
+    tmdbId: String(page.id),
+    imdbId: '',
+    officialWebsite: '',
+    companies: [],
+    countries: [],
+    languages: [],
+    languageCode: ''
+  };
 
   const pushUnique = (list, value) => {
     if (value && !list.includes(value)) list.push(value);
@@ -1027,6 +1411,19 @@ async function fetchWikidataEnrichment(page) {
     if (!enrichment.languageCode && row.iso && row.iso.value) {
       enrichment.languageCode = row.iso.value;
     }
+    if (!enrichment.imdbId && row.imdb && row.imdb.value) {
+      enrichment.imdbId = row.imdb.value;
+    }
+    if (!enrichment.entityId && row.item && row.item.value) {
+      enrichment.entityId = row.item.value.split('/').pop();
+      enrichment.entityUrl = row.item.value;
+    }
+    if (!enrichment.label && row.itemLabel && row.itemLabel.value) {
+      enrichment.label = row.itemLabel.value;
+    }
+    if (!enrichment.officialWebsite && row.website && row.website.value) {
+      enrichment.officialWebsite = row.website.value;
+    }
   });
 
   cache[cacheKey] = { ts: Date.now(), data: enrichment };
@@ -1035,6 +1432,25 @@ async function fetchWikidataEnrichment(page) {
 
 function mergeWikidata(data, enrichment) {
   if (!enrichment) return;
+
+  // Wikidata에서 확인된 보조 데이터는 별도 객체로도 보존한다.
+  if (enrichment.entityId) {
+    data.wikidata = {
+      entityId: enrichment.entityId,
+      url: enrichment.entityUrl,
+      label: enrichment.label,
+      tmdbId: enrichment.tmdbId,
+      imdbId: enrichment.imdbId,
+      officialWebsite: enrichment.officialWebsite,
+      companies: enrichment.companies.slice(),
+      countries: enrichment.countries.slice(),
+      languages: enrichment.languages.slice(),
+      languageCode: enrichment.languageCode
+    };
+  }
+  if (!data.homepage && enrichment.officialWebsite) {
+    data.homepage = enrichment.officialWebsite;
+  }
 
   if (data.productionCompanies.length === 0) {
     enrichment.companies.forEach(name => data.productionCompanies.push({ name: name }));
@@ -1048,6 +1464,73 @@ function mergeWikidata(data, enrichment) {
   if (!data.originalLanguageCode && enrichment.languageCode) {
     data.originalLanguageCode = enrichment.languageCode;
   }
+  if (!data.imdbId && enrichment.imdbId) {
+    data.imdbId = enrichment.imdbId;
+  }
+}
+
+async function fetchOmdb(apiKey, page, data) {
+  const key = String(apiKey || '').trim();
+  if (!key) return null;
+
+  if (!window.__omdbCache) window.__omdbCache = {};
+  const cacheKey = data.imdbId || `${page.kind}:${data.title || ''}:${String(data.releaseDate || '').slice(0, 4)}`;
+  const cached = window.__omdbCache[cacheKey];
+  if (cached && (Date.now() - cached.ts) < 24 * 60 * 60 * 1000) return cached.data;
+
+  let url = 'https://www.omdbapi.com/?apikey=' + encodeURIComponent(key) + '&plot=full';
+  if (data.imdbId) {
+    url += '&i=' + encodeURIComponent(data.imdbId);
+  } else {
+    if (!data.title) return null;
+    url += '&t=' + encodeURIComponent(data.title);
+    const year = String(data.releaseDate || '').slice(0, 4);
+    if (/^\d{4}$/.test(year)) url += '&y=' + year;
+    url += '&type=' + (page.kind === 'tv' ? 'series' : 'movie');
+  }
+
+  const response = await fetchWithTimeout(url, { credentials: 'omit' }, 8000);
+  if (!response.ok) throw new Error('OMDb HTTP ' + response.status);
+
+  const json = await response.json();
+  if (String(json.Response) !== 'True') return null;
+
+  const result = {
+    title: json.Title || '',
+    year: json.Year || '',
+    rated: json.Rated || '',
+    released: json.Released || '',
+    runtime: json.Runtime || '',
+    genre: json.Genre || '',
+    director: json.Director || '',
+    writer: json.Writer || '',
+    actors: json.Actors || '',
+    plot: json.Plot || '',
+    language: json.Language || '',
+    country: json.Country || '',
+    awards: json.Awards || '',
+    poster: (json.Poster && json.Poster !== 'N/A') ? json.Poster : '',
+    ratings: Array.isArray(json.Ratings) ? json.Ratings : [],
+    metascore: json.Metascore || '',
+    imdbRating: json.imdbRating || '',
+    imdbVotes: json.imdbVotes || '',
+    imdbID: json.imdbID || '',
+    type: json.Type || '',
+    dvd: json.DVD || '',
+    boxOffice: json.BoxOffice || '',
+    production: json.Production || '',
+    website: json.Website || ''
+  };
+
+  window.__omdbCache[cacheKey] = { ts: Date.now(), data: result };
+  return result;
+}
+
+function mergeOmdb(data, omdb) {
+  if (!omdb) return;
+  data.omdb = omdb;
+  if (!data.imdbId && omdb.imdbID) data.imdbId = omdb.imdbID;
+  if (!data.overview && omdb.plot) data.overview = omdb.plot;
 }
 
 async function enrichMediaData(data, options) {
@@ -1061,10 +1544,11 @@ async function enrichMediaData(data, options) {
     tasks.push((async () => {
       for (const kind of ['posters', 'backdrops']) {
         try {
-          const urls = await fetchGalleryUrls(kind, basePath, options);
+          const targetCount = Number(data[kind === 'posters' ? 'posterCount' : 'backdropCount']) || 0;
+          const urls = await fetchGalleryUrls(kind, basePath, Object.assign({}, options, { targetCount: targetCount }));
           if (urls.length > 0) mergeGalleryImages(data, kind, urls);
         } catch (error) {
-          console.warn(`TMDB ${kind} 보강 실패:`, error);
+          reportEnrichmentIssue(`TMDB ${kind} 보강 실패`, error);
         }
       }
     })());
@@ -1076,7 +1560,7 @@ async function enrichMediaData(data, options) {
         const fetched = await fetchCastAndCrew(basePath);
         mergeCastAndCrew(data, fetched);
       } catch (error) {
-        console.warn('TMDB 출연진/제작진 보강 실패:', error);
+        reportEnrichmentIssue('TMDB 출연진/제작진 보강 실패', error);
       }
     })());
   }
@@ -1086,7 +1570,7 @@ async function enrichMediaData(data, options) {
       try {
         data.videos = await fetchAllVideos(basePath, data.videos);
       } catch (error) {
-        console.warn('TMDB 영상 보강 실패:', error);
+        reportEnrichmentIssue('TMDB 영상 보강 실패', error);
       }
     })());
   }
@@ -1097,17 +1581,27 @@ async function enrichMediaData(data, options) {
         const releases = await fetchReleases(basePath);
         if (releases.length > 0) data.releases = releases;
       } catch (error) {
-        console.warn('TMDB 방송일 보강 실패:', error);
+        reportEnrichmentIssue('TMDB 방송일 보강 실패', error);
       }
     })());
   }
 
-  if (options.wikidata) {
+  // Wikidata로 IMDb ID를 먼저 확보한 뒤 OMDb를 호출한다(같은 작업 안에서 순차 실행).
+  if (options.wikidata || options.omdbApiKey) {
     tasks.push((async () => {
-      try {
-        mergeWikidata(data, await fetchWikidataEnrichment(page));
-      } catch (error) {
-        console.warn('Wikidata 보강 실패:', error);
+      if (options.wikidata) {
+        try {
+          mergeWikidata(data, await fetchWikidataEnrichment(page));
+        } catch (error) {
+          reportEnrichmentIssue('Wikidata 보강 실패', error);
+        }
+      }
+      if (options.omdbApiKey) {
+        try {
+          mergeOmdb(data, await fetchOmdb(options.omdbApiKey, page, data));
+        } catch (error) {
+          reportEnrichmentIssue('OMDb 보강 실패', error);
+        }
       }
     })());
   }
@@ -1198,7 +1692,7 @@ function extractPersonData() {
       production: [],
       all: []
     },
-    schemaVersion: '1.7',
+    schemaVersion: '1.7.2',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -1457,10 +1951,19 @@ async function extractMediaData(options = {}) {
     spokenLanguages: [],
     credits: {
       cast: [],
-      crew: []
+      crew: [],
+      castTotal: 0,
+      crewTotal: 0,
+      directors: [],
+      writers: []
     },
     videos: [],
     youtubeLinks: [],
+    mediaSection: { tabs: [], items: [] },
+    topBilledCast: [],
+    imdbId: '',
+    omdb: null,
+    wikidata: null,
     images: {
       posters: [],
       backdrops: [],
@@ -1488,7 +1991,8 @@ async function extractMediaData(options = {}) {
     runtimeInfo: '',
     releases: [],
     statusKey: '',
-    schemaVersion: '1.7',
+    isComplete: false,
+    schemaVersion: '1.7.2',
     sourceUrl: window.location.href,
     extractedAt: new Date().toISOString()
   };
@@ -1587,6 +2091,14 @@ async function extractMediaData(options = {}) {
 
       if (ldData.inLanguage) {
         data.originalLanguageCode = String(ldData.inLanguage);
+      }
+
+      if (ldData.sameAs) {
+        const sameAsList = Array.isArray(ldData.sameAs) ? ldData.sameAs : [ldData.sameAs];
+        sameAsList.forEach(link => {
+          const match = String(link || '').match(/imdb\.com\/title\/(tt\d+)/);
+          if (match && !data.imdbId) data.imdbId = match[1];
+        });
       }
       
       if (ldData.duration) {
@@ -2165,7 +2677,7 @@ async function extractMediaData(options = {}) {
     }
     
     const castCards = $$('#cast_scroller .card, .people .card');
-    castCards.forEach(card => {
+    castCards.forEach((card, index) => {
       const nameEl = card.querySelector('p a');
       const charEl = card.querySelector('.character');
       const imgEl = card.querySelector('img');
@@ -2173,9 +2685,25 @@ async function extractMediaData(options = {}) {
       
       if (nameEl) {
         const imageUrl = getImageSource(imgEl);
+        const personLink = card.querySelector('a[href*="/person/"]') || nameEl;
+        const personMatch = String(personLink.getAttribute('href') || '').match(/\/person\/(\d+)(?:-([^/?#]*))?/);
+        const profileWrap = card.querySelector('.profile, .glyphicons.profile');
+        let placeholderClass = '';
+        if (profileWrap) {
+          if (profileWrap.classList.contains('one')) placeholderClass = 'one';
+          else if (profileWrap.classList.contains('two')) placeholderClass = 'two';
+        }
+
         data.credits.cast.push({
+          id: personMatch ? Number(personMatch[1]) : null,
+          order: index + 1,
+          credit_id: card.getAttribute('data-credit-id') || '',
+          cast_id: card.getAttribute('data-cast-id') ? Number(card.getAttribute('data-cast-id')) : null,
           name: nameEl.textContent.trim(),
           character: charEl ? charEl.textContent.trim() : '',
+          known_for_department: 'Acting',
+          profile_path: imageUrl ? '/' + getImageFilename(imageUrl) : '',
+          placeholder_class: placeholderClass,
           image: imageUrl,
           image_high: imageUrl ? getHighResImage(imageUrl, 'high') : '',
           image_original: imageUrl ? getHighResImage(imageUrl, 'original') : '',
@@ -2197,6 +2725,50 @@ async function extractMediaData(options = {}) {
       const krRelease = data.releases.find(release => release.countryCode === 'KR' && release.certification);
       if (krRelease) data.certification = krRelease.certification;
     }
+
+    // ===== 10. Media 섹션 + Top Billed Cast(정적 자산) + 영상 썸네일 =====
+    data.mediaSection = extractMediaSection();
+    data.topBilledCast = extractTopBilledCast();
+    (data.videos || []).forEach(video => {
+      if (!video.thumbnail && video.key) {
+        video.thumbnail = 'https://i.ytimg.com/vi/' + video.key + '/hqdefault.jpg';
+      }
+    });
+
+    if (!data.imdbId) {
+      const imdbLink = document.querySelector('a[href*="imdb.com/title/tt"]');
+      const imdbMatch = String(imdbLink ? imdbLink.getAttribute('href') : '').match(/imdb\.com\/title\/(tt\d+)/);
+      if (imdbMatch) data.imdbId = imdbMatch[1];
+    }
+
+    // ===== 11. 수집 범위/정합성 메타 =====
+    ensureImageMetadata(data.images.posters);
+    ensureImageMetadata(data.images.backdrops);
+
+    const posterCollected = data.images.posters.length;
+    const backdropCollected = data.images.backdrops.length;
+    const posterTotal = Number(data.posterCount) || posterCollected;
+    const backdropTotal = Number(data.backdropCount) || backdropCollected;
+
+    data.images.collected = { posters: posterCollected, backdrops: backdropCollected };
+    data.images.totals = { posters: posterTotal, backdrops: backdropTotal };
+    data.images.pagination = {
+      posters: buildPaginationInfo(posterCollected, posterTotal),
+      backdrops: buildPaginationInfo(backdropCollected, backdropTotal)
+    };
+    const postersIncomplete = posterCollected < posterTotal;
+    const backdropsIncomplete = backdropCollected < backdropTotal;
+    data.images.has_next_page = postersIncomplete || backdropsIncomplete;
+    data.images.incomplete = { posters: postersIncomplete, backdrops: backdropsIncomplete };
+    data.images.next_page_url = '';
+
+    data.credits.castTotal = Number(data.credits.castTotal) || data.credits.cast.length;
+    data.credits.crewTotal = Number(data.credits.crewTotal) || data.credits.crew.length;
+    buildCreditGroups(data);
+
+    data.isComplete = !postersIncomplete && !backdropsIncomplete &&
+      data.credits.cast.length >= data.credits.castTotal &&
+      data.credits.crew.length >= data.credits.crewTotal;
 
     // 숫자 필드 타입 정규화 (LD+JSON 숫자 / DOM 문자열 혼재 제거)
     data.voteAverage = toNumber(data.voteAverage);
@@ -2220,7 +2792,7 @@ async function extractMediaData(options = {}) {
   // 본문·소개글·앵커에 포함된 유튜브 링크 + 수집한 영상 URL
   data.youtubeLinks = collectYoutubeLinks(
     [data.overview, data.tagline, data.homepage],
-    (data.videos || []).map(video => video.url)
+    (data.videos || []).map(video => ({ url: video.url, title: video.name }))
   );
 
   return data;

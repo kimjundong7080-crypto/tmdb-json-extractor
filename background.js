@@ -1,6 +1,41 @@
 // background.js - 컨텍스트 메뉴, 메시지 라우팅, 폴더 구조 JSON 다운로드, 사이트맵 프록시
 const ALLOWED_FETCH_HOSTS = ['files.tmdb.org'];
 
+// Chrome 시작/확장 설치 시 Python 보강 watch 프로세스를 자동 실행한다.
+// 네이티브 호스트가 설치되지 않았으면 조용히 무시한다.
+const NATIVE_ENRICHER_HOST = 'com.tmdb_json_extractor.enricher';
+
+function startPythonEnricher() {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = result => {
+      if (!settled) {
+        settled = true;
+        resolve(result);
+      }
+    };
+
+    try {
+      const port = chrome.runtime.connectNative(NATIVE_ENRICHER_HOST);
+      if (!port) {
+        finish({ ok: false, error: 'native port unavailable' });
+        return;
+      }
+      port.onDisconnect.addListener(() => {
+        const error = chrome.runtime.lastError;
+        finish(error ? { ok: false, error: error.message } : { ok: true });
+      });
+      // 호스트가 정상 실행되면 연결이 유지되므로 잠시 후 성공으로 응답한다.
+      setTimeout(() => finish({ ok: true }), 800);
+    } catch (error) {
+      finish({ ok: false, error: String((error && error.message) || error) });
+    }
+  });
+}
+
+chrome.runtime.onStartup.addListener(startPythonEnricher);
+chrome.runtime.onInstalled.addListener(startPythonEnricher);
+
 chrome.runtime.onInstalled.addListener(() => {
   // 업데이트 시 중복 id 오류를 막기 위해 기존 메뉴를 먼저 제거
   chrome.contextMenus.removeAll(() => {
@@ -98,6 +133,12 @@ async function sendAction(tabId, action) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
+
+  // 패널의 [Python 보강 실행] 버튼 → 네이티브 호스트로 watcher 시작
+  if (message.action === "startPythonEnricher") {
+    startPythonEnricher().then(result => sendResponse(result));
+    return true;
+  }
 
   // 크롤러 다운로드: content script는 chrome.downloads를 쓸 수 없으므로 여기서 저장한다.
   if (message.action === "crawlerDownload") {
@@ -285,7 +326,7 @@ function hashString(value) {
 
 async function loadPackagedSettings() {
   try {
-    const response = await fetch(chrome.runtime.getURL("settings.json"));
+    const response = await fetch(chrome.runtime.getURL("settings.json"), { cache: "no-store" });
     if (!response.ok) return null;
     const text = await response.text();
     const data = JSON.parse(text);

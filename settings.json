@@ -1,14 +1,40 @@
 {
   "_v": 3,
   "language": "ko-KR",
-  "targets": { "movie": true, "tv": true, "cast": false, "director": false },
-  "sitemapKinds": { "movie": true, "tv": true, "person": false },
+  "saveImages": false,
+  "targets": {
+    "movie": true,
+    "tv": true,
+    "cast": true,
+    "director": true
+  },
+  "sitemapKinds": {
+    "movie": true,
+    "tv": true,
+    "person": true
+  },
+  "sitemapBatch": 1000,
   "newestFirst": false,
+  "peoplePerTitle": 30,
+  "allLanguages": false,
+  "collectFilmography": false,
+  "followLists": true,
   "autoFollow": true,
   "autoFollowQueue": 5,
   "autoFollowLimit": 8,
-  "peoplePerTitle": 30,
-  "saveImages": false,
   "overwrite": true,
-  "autoLog": true
+  "autoLog": true,
+  "useWikidata": true,
+  "humanize": true,
+  "readDelay": true,
+  "minDelayMs": 3000,
+  "maxDelayMs": 7000,
+  "subpageMinMs": 700,
+  "subpageMaxMs": 1800,
+  "breakEveryMin": 40,
+  "breakEveryMax": 90,
+  "breakMinSec": 120,
+  "breakMaxSec": 300,
+  "maxListPages": 300,
+  "folder": "tmdb"
 }
