@@ -11,6 +11,9 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $OutDir) { $OutDir = Join-Path $InputDir 'enriched' }
 $ExtensionId = ($ExtensionId.Trim() -replace '^chrome-extension://', '').TrimEnd('/')
+if ($ExtensionId -notmatch '^[a-p]{32}$') {
+    throw "Invalid extension ID '$ExtensionId'. Copy the 32-character ID from chrome://extensions (it contains only a-p)."
+}
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
@@ -22,19 +25,26 @@ if (-not (Test-Path -LiteralPath $enrichScript)) {
 New-Item -ItemType Directory -Force -Path $InputDir | Out-Null
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-if (-not $Python) {
-    $found = Get-Command pythonw.exe -ErrorAction SilentlyContinue
-    if ($found) {
-        $Python = $found.Source
-    } else {
-        $found = Get-Command python.exe -ErrorAction SilentlyContinue
-        if ($found) {
-            $Python = $found.Source
-        } else {
-            $found = Get-Command py.exe -ErrorAction SilentlyContinue
-            if ($found) { $Python = $found.Source } else { throw "Python not found. Pass -Python <path>." }
-        }
+function Test-PythonExecutable {
+    param([string]$Exe)
+    try {
+        & $Exe --version *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
     }
+}
+
+if (-not $Python) {
+    # Windows ships a Store alias stub named python.exe that must be skipped:
+    # it fails with a "Python was not found" message, so each candidate is executed.
+    foreach ($name in @('pythonw.exe', 'python.exe', 'py.exe')) {
+        $found = Get-Command $name -ErrorAction SilentlyContinue
+        if ($found -and (Test-PythonExecutable $found.Source)) { $Python = $found.Source; break }
+    }
+    if (-not $Python) { throw "Python not found. Pass -Python <path>." }
+} elseif (-not (Test-PythonExecutable $Python)) {
+    throw "Python at '$Python' does not run. Pass -Python <path>."
 }
 
 $cscCandidates = @(
@@ -72,12 +82,18 @@ $manifest = [ordered]@{
     (New-Object System.Text.UTF8Encoding($false))
 )
 
-foreach ($browserKey in @(
-    'HKCU:\Software\Google\Chrome\NativeMessagingHosts\' + $hostName,
-    'HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\' + $hostName
-)) {
+$browserKeys = @(
+    ('HKCU:\Software\Google\Chrome\NativeMessagingHosts\' + $hostName),
+    ('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\' + $hostName)
+)
+foreach ($browserKey in $browserKeys) {
     New-Item -Path $browserKey -Force | Out-Null
-    Set-ItemProperty -Path $browserKey -Name '(default)' -Value $manifestPath
+    New-ItemProperty -Path $browserKey -Name '(Default)' -Value $manifestPath -PropertyType String -Force | Out-Null
+    $registered = (Get-Item -Path $browserKey).GetValue('')
+    if ($registered -ne $manifestPath) {
+        throw "Failed to register native messaging host at $browserKey (got '$registered')."
+    }
+    Write-Host "  Reg    : $browserKey"
 }
 
 Write-Host ""

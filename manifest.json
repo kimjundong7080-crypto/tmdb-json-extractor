@@ -14,6 +14,7 @@
   ],
   "host_permissions": [
     "*://www.themoviedb.org/*",
+    "https://files.tmdb.org/*",
     "https://query.wikidata.org/*",
     "https://www.omdbapi.com/*"
   ],
